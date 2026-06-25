@@ -132,7 +132,7 @@ describe('TokenManager', () => {
       expect(logger.error).toHaveBeenCalled();
     });
 
-    it('warns when credentials provided but no auth metadata found', async () => {
+    it('enters no-auth when resource discovery fails but AS returns no metadata', async () => {
       mockDiscoverResource.mockRejectedValue(new Error('Not found'));
       mockDiscoverAS.mockResolvedValue(undefined);
 
@@ -142,12 +142,15 @@ describe('TokenManager', () => {
 
       await tm.discover();
 
+      expect(tm.getAuthMode().type).toBe('no-auth');
       expect(logger.warn).toHaveBeenCalledWith(
-        expect.stringContaining('Credentials were provided'),
+        expect.stringContaining('does not announce auth requirements'),
       );
+
+      tm.stop();
     });
 
-    it('handles discovery network failure gracefully', async () => {
+    it('stays in discovery-failed mode when both endpoints throw', async () => {
       mockDiscoverResource.mockRejectedValue(new Error('ECONNREFUSED'));
       mockDiscoverAS.mockRejectedValue(new Error('ECONNREFUSED'));
 
@@ -157,7 +160,55 @@ describe('TokenManager', () => {
 
       await tm.discover();
 
-      expect(tm.getAuthMode().type).toBe('no-auth');
+      expect(tm.getAuthMode().type).toBe('discovery-failed');
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('OAuth discovery failed'),
+      );
+
+      tm.stop();
+    });
+
+    it('schedules re-discovery when both endpoints fail', async () => {
+      mockDiscoverResource.mockRejectedValue(new Error('ECONNREFUSED'));
+      mockDiscoverAS.mockRejectedValue(new Error('ECONNREFUSED'));
+
+      const logger = createMockLogger();
+      const config = createTestConfig();
+      const tm = createTokenManager(config, logger);
+
+      await tm.discover();
+
+      expect(logger.info).toHaveBeenCalledWith(
+        'Scheduling OAuth re-discovery',
+        expect.objectContaining({ attempt: 1 }),
+      );
+
+      tm.stop();
+    });
+
+    it('recovers from discovery-failed when re-discovery succeeds', async () => {
+      mockDiscoverResource.mockRejectedValue(new Error('ECONNREFUSED'));
+      mockDiscoverAS.mockRejectedValue(new Error('ECONNREFUSED'));
+
+      const logger = createMockLogger();
+      const config = createTestConfig();
+      const tm = createTokenManager(config, logger);
+
+      await tm.discover();
+      expect(tm.getAuthMode().type).toBe('discovery-failed');
+
+      setupAuthenticatedDiscovery();
+      mockAuth.mockResolvedValue('AUTHORIZED');
+
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      expect(tm.getAuthMode().type).toBe('authenticated');
+      expect(tm.getAuthProvider()).toBeDefined();
+      expect(logger.info).toHaveBeenCalledWith(
+        'OAuth re-discovery succeeded, attempting token prefetch',
+      );
+
+      tm.stop();
     });
   });
 

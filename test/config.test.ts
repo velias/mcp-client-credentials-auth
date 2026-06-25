@@ -75,4 +75,34 @@ describe('Config', () => {
     expect(() => loadConfig()).toThrow('Invalid configuration');
   });
 
+  it('accepts http:// URL', () => {
+    process.env.MCP_CC_PROXY_REMOTE_MCP_URL = 'http://localhost:3000/mcp';
+    process.env.MCP_CC_PROXY_CLIENT_ID = 'test-client';
+    process.env.MCP_CC_PROXY_CLIENT_SECRET = 'test-secret';
+    const config = loadConfig();
+    expect(config.remoteMcpUrl).toBe('http://localhost:3000/mcp');
+  });
+
+  it('accepts https:// URL', () => {
+    process.env.MCP_CC_PROXY_REMOTE_MCP_URL = 'https://mcp.example.com/mcp';
+    process.env.MCP_CC_PROXY_CLIENT_ID = 'test-client';
+    process.env.MCP_CC_PROXY_CLIENT_SECRET = 'test-secret';
+    const config = loadConfig();
+    expect(config.remoteMcpUrl).toBe('https://mcp.example.com/mcp');
+  });
+
+  it('rejects file:// URL scheme', () => {
+    process.env.MCP_CC_PROXY_REMOTE_MCP_URL = 'file:///etc/passwd';
+    process.env.MCP_CC_PROXY_CLIENT_ID = 'test-client';
+    process.env.MCP_CC_PROXY_CLIENT_SECRET = 'test-secret';
+    expect(() => loadConfig()).toThrow('Invalid configuration');
+  });
+
+  it('rejects ftp:// URL scheme', () => {
+    process.env.MCP_CC_PROXY_REMOTE_MCP_URL = 'ftp://ftp.example.com/data';
+    process.env.MCP_CC_PROXY_CLIENT_ID = 'test-client';
+    process.env.MCP_CC_PROXY_CLIENT_SECRET = 'test-secret';
+    expect(() => loadConfig()).toThrow('Invalid configuration');
+  });
+
 });

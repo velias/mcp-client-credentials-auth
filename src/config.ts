@@ -1,7 +1,16 @@
 import { z } from 'zod/v4';
 
 export const ConfigSchema = z.object({
-  remoteMcpUrl: z.url(),
+  remoteMcpUrl: z.url().check(
+    z.refine((url) => {
+      try {
+        const scheme = new URL(url).protocol;
+        return scheme === 'http:' || scheme === 'https:';
+      } catch {
+        return false;
+      }
+    }, 'URL scheme must be http or https'),
+  ),
   clientId: z.string().min(1),
   clientSecret: z.string().min(1),
   refreshSkewSeconds: z.number().int().positive().default(30),

@@ -92,6 +92,7 @@ function createMockTokenManager(mode: AuthMode = { type: 'authenticated', provid
     getAuthProvider: vi.fn().mockReturnValue(mode.type === 'authenticated' ? {} : undefined),
     getAuthMode: vi.fn().mockReturnValue(mode),
     invalidate: vi.fn(),
+    stop: vi.fn(),
   };
 }
 
@@ -123,8 +124,8 @@ describe('Proxy auth mode errors', () => {
   let proxyHandle: { close(): Promise<void> } | undefined;
 
   afterEach(async () => {
-    await endClient?.close().catch(() => {});
     await proxyHandle?.close().catch(() => {});
+    await endClient?.close().catch(() => {});
     for (const s of upstreamServers) await s.close().catch(() => {});
     upstreamServers.length = 0;
   });
@@ -165,8 +166,8 @@ describe('Proxy capabilities polling', () => {
   let proxyHandle: { close(): Promise<void> } | undefined;
 
   afterEach(async () => {
-    await endClient?.close().catch(() => {});
     await proxyHandle?.close().catch(() => {});
+    await endClient?.close().catch(() => {});
     for (const s of upstreamServers) await s.close().catch(() => {});
     upstreamServers.length = 0;
   });
@@ -255,8 +256,8 @@ describe('Proxy resources and prompts polling', () => {
   let proxyHandle: { close(): Promise<void> } | undefined;
 
   afterEach(async () => {
-    await endClient?.close().catch(() => {});
     await proxyHandle?.close().catch(() => {});
+    await endClient?.close().catch(() => {});
     for (const s of upstreamServers) await s.close().catch(() => {});
     upstreamServers.length = 0;
   });
@@ -358,8 +359,8 @@ describe('Proxy buildClientIdentity fallback', () => {
   let proxyHandle: { close(): Promise<void> } | undefined;
 
   afterEach(async () => {
-    await endClient?.close().catch(() => {});
     await proxyHandle?.close().catch(() => {});
+    await endClient?.close().catch(() => {});
     for (const s of upstreamServers) await s.close().catch(() => {});
     upstreamServers.length = 0;
   });

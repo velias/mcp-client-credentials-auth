@@ -34,11 +34,12 @@ test/
 - **Two-phase connection** -- discovery connection gets remote server info, then a real connection is established with the local client's actual identity/capabilities after the local handshake completes
 - **Protocol-version agnostic** -- uses SDK fallback handlers for bidirectional pass-through
 - **No hardcoded method tables** -- all 4 message flows use `fallbackRequestHandler`/`fallbackNotificationHandler`
-- **`_meta` sanitization** -- auth-like keys stripped before forwarding to remote
+- **`_meta` sanitization** -- auth-like keys stripped from all client-to-server messages (requests and notifications) before forwarding to remote
 - **Transport fallback** -- Streamable HTTP first, SSE if that fails
-- **Automatic reconnection** -- detects remote `onclose`, reconnects with stored identity/capabilities, restarts polling
-- **Local disconnect cleanup** -- detects `localServer.onclose` (stdin closed) and exits cleanly
-- **Timeouts on all outgoing calls** -- `requestTimeoutMs` applied via `AbortSignal.timeout` to MCP requests, OAuth discovery, and token acquisition
+- **Automatic reconnection** -- detects remote `onclose`, reconnects with exponential backoff (1s--60s with jitter), restarts polling; backoff resets after a connection is stable for 30s
+- **OAuth re-discovery** -- if IdP is unreachable at startup, stays in `discovery-failed` mode (rejects requests with error) and retries discovery with exponential backoff (5s--60s); transitions to `authenticated` mode when IdP recovers
+- **Local disconnect cleanup** -- detects `localServer.onclose` (stdin closed), awaits remote close with 2s timeout, then exits
+- **Timeouts on all outgoing calls** -- `requestTimeoutMs` applied per-request via SDK `{ timeout }` option for MCP calls, and per-call via `AbortSignal.timeout` for OAuth discovery and token acquisition. Transport constructors do NOT receive a signal (a long-lived signal would go stale and break all requests after it fires).
 - **Proactive refresh via `saveTokens` hook** -- monkey-patches `ClientCredentialsProvider.saveTokens` to schedule a timer; this is a deliberate coupling to SDK internals (see upgrade checklist)
 
 ## Performance Conventions
@@ -84,6 +85,7 @@ All logging goes to stderr via `logger.ts`. stdout is reserved for JSON-RPC.
 - Use `InMemoryTransport` from SDK for proxy integration tests
 - No real network calls in tests
 - Test file naming: `test/<module>.test.ts`
+- **Proxy test teardown order**: always close `proxyHandle` before `endClient` in `afterEach`. Closing the end client first triggers `localServer.onclose` which calls `process.exit(0)` (Vitest intercepts this and throws, causing unhandled rejections). Closing the proxy first sets `closingIntentionally = true`, preventing the exit.
 
 ## MCP SDK Upgrade Checklist
 
@@ -98,8 +100,8 @@ When bumping `@modelcontextprotocol/sdk`, check the following areas where the pr
 
 ### Transport layer (`proxy.ts`)
 
-- **`StreamableHTTPClientTransport` options** -- we pass `{ authProvider, requestInit: { signal } }`. Check if the options type changes or if `requestInit.signal` handling is altered.
-- **`SSEClientTransport` options** -- same pattern with `authProvider` and `requestInit`.
+- **`StreamableHTTPClientTransport` options** -- we pass `{ authProvider }`. We intentionally do NOT pass `requestInit.signal` because a transport-level `AbortSignal.timeout` goes stale after firing and breaks all subsequent requests. Per-request timeouts are handled via the SDK's `{ timeout }` option instead.
+- **`SSEClientTransport` options** -- same pattern with `authProvider` only.
 - **`Client.onclose`** -- we rely on `onclose` firing when the remote transport disconnects. If the SDK changes to an event emitter or renames this, reconnection breaks.
 - **`Client.connect()` re-entrancy** -- we create a new `Client` instance for each reconnection. Verify the SDK doesn't introduce singleton restrictions or session ID reuse that would prevent this.
 - **401 retry behavior** -- the SDK's transport handles 401 responses by calling `auth()` internally. Our proactive refresh reduces how often this path is hit, but if the SDK removes automatic 401 retry, requests will fail when proactive refresh is late.

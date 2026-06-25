@@ -75,9 +75,6 @@ export async function createProxy(
   try {
     const httpTransport = new StreamableHTTPClientTransport(remoteUrl, {
       authProvider,
-      ...(config.requestTimeoutMs
-        ? { requestInit: { signal: AbortSignal.timeout(config.requestTimeoutMs) } }
-        : {}),
     });
     await discoveryClient.connect(httpTransport);
     logger.info('Discovery: connected via Streamable HTTP');
@@ -88,9 +85,6 @@ export async function createProxy(
     try {
       const sseTransport = new SSEClientTransport(remoteUrl, {
         authProvider,
-        ...(config.requestTimeoutMs
-          ? { requestInit: { signal: AbortSignal.timeout(config.requestTimeoutMs) } }
-          : {}),
       });
       await discoveryClient.connect(sseTransport);
       logger.info('Discovery: connected to remote MCP server via SSE');
@@ -132,9 +126,6 @@ export async function createProxy(
     try {
       const httpTransport = new StreamableHTTPClientTransport(remoteUrl, {
         authProvider,
-        ...(config.requestTimeoutMs
-          ? { requestInit: { signal: AbortSignal.timeout(config.requestTimeoutMs) } }
-          : {}),
       });
       await client.connect(httpTransport);
       logger.info('Connected to remote MCP server via Streamable HTTP', {
@@ -146,9 +137,6 @@ export async function createProxy(
       });
       const sseTransport = new SSEClientTransport(remoteUrl, {
         authProvider,
-        ...(config.requestTimeoutMs
-          ? { requestInit: { signal: AbortSignal.timeout(config.requestTimeoutMs) } }
-          : {}),
       });
       await client.connect(sseTransport);
       logger.info('Connected to remote MCP server via SSE', {
@@ -207,10 +195,25 @@ export async function createProxy(
   let storedIdentity: Implementation | undefined;
   let storedCapabilities: ClientCapabilities | undefined;
   let reconnecting = false;
+  let reconnectAttempt = 0;
+  let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  let lastStableConnect = 0;
+  const RECONNECT_BASE_MS = 1000;
+  const RECONNECT_MAX_MS = 60000;
+  const RECONNECT_STABLE_THRESHOLD_MS = 30000;
+
+  function getReconnectDelay(): number {
+    const exponential = Math.min(RECONNECT_BASE_MS * 2 ** reconnectAttempt, RECONNECT_MAX_MS);
+    const jitter = Math.random() * exponential * 0.3;
+    return Math.round(exponential + jitter);
+  }
 
   function wireOnClose(client: Client): void {
     client.onclose = () => {
       if (reconnecting) return;
+      if (lastStableConnect > 0 && Date.now() - lastStableConnect > RECONNECT_STABLE_THRESHOLD_MS) {
+        reconnectAttempt = 0;
+      }
       logger.warn('Remote connection lost, attempting reconnection');
       void reconnect();
     };
@@ -227,6 +230,18 @@ export async function createProxy(
       return;
     }
 
+    if (reconnectAttempt > 0) {
+      const delayMs = getReconnectDelay();
+      logger.info('Scheduling reconnection attempt', {
+        attempt: reconnectAttempt + 1,
+        delayMs,
+      });
+      await new Promise<void>((resolve) => {
+        reconnectTimer = setTimeout(resolve, delayMs);
+      });
+    }
+
+    logger.info('Attempting reconnection', { attempt: reconnectAttempt + 1 });
     try {
       remoteClient = await connectRemote(storedIdentity, storedCapabilities);
       wireRemoteHandlers(remoteClient);
@@ -237,12 +252,23 @@ export async function createProxy(
       await notifyListChanges(newCaps);
 
       startPolling();
-      logger.info('Reconnection successful');
+      lastStableConnect = Date.now();
+      if (reconnectAttempt > 0) {
+        logger.info('Reconnection successful', { afterAttempts: reconnectAttempt + 1 });
+      } else {
+        logger.info('Reconnection successful');
+      }
+      reconnectAttempt = 0;
     } catch (err) {
-      logger.error('Reconnection failed', {
+      logger.warn('Reconnection failed, will retry', {
         error: err instanceof Error ? err.message : String(err),
+        attempt: reconnectAttempt + 1,
       });
       remoteClient = undefined;
+      reconnectAttempt++;
+      reconnecting = false;
+      void reconnect();
+      return;
     } finally {
       reconnecting = false;
     }
@@ -314,9 +340,10 @@ export async function createProxy(
     await readyPromise;
     if (!remoteClient) return;
     logger.debug('Forwarding client notification', { method: notification.method });
+    const sanitizedParams = sanitizeMeta(notification.params);
     await remoteClient.notification({
       method: notification.method,
-      params: notification.params,
+      params: sanitizedParams,
     });
   };
 
@@ -332,9 +359,16 @@ export async function createProxy(
     reconnecting = true;
     stopPolling();
     if (remoteClient) {
-      void remoteClient.close();
+      const client = remoteClient;
+      Promise.race([
+        client.close(),
+        new Promise((r) => setTimeout(r, 2000)),
+      ]).catch(() => {}).finally(() => {
+        process.exit(0);
+      });
+    } else {
+      process.exit(0);
     }
-    process.exit(0);
   };
 
   // Capabilities polling
@@ -415,6 +449,10 @@ export async function createProxy(
       logger.info('Shutting down proxy');
       closingIntentionally = true;
       reconnecting = true;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = undefined;
+      }
       stopPolling();
       await localServer.close();
       if (remoteClient) {

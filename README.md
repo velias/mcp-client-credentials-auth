@@ -14,7 +14,7 @@ To obtain the required `client_id` and `client_secret`, look for a "Service Acco
 - **Transparent forwarding** - all MCP methods forwarded bidirectionally (tools, resources, prompts, sampling, notifications)
 - **Proactive token refresh** - tokens refreshed before expiry using `refreshSkewSeconds` (default 30s) with automatic retries, no request latency spikes
 - **Transport fallback** - Streamable HTTP with automatic SSE fallback
-- **Automatic reconnection** - detects remote server disconnects and automatically reconnects with preserved client identity and capabilities
+- **Automatic reconnection** - detects remote server disconnects and reconnects with exponential backoff, preserving client identity and capabilities
 - **Live change detection** - polls the remote server for capability changes (tools, resources, prompts) and notifies your MCP client automatically
 - **Identity forwarding** - remote server name and capabilities forwarded to your MCP client; your client's real identity and capabilities forwarded to the remote MCP server
 - **Timeouts on all network calls** - all outgoing connections (MCP requests, OAuth discovery, token acquisition) enforce `requestTimeoutMs` to prevent hangs
@@ -35,6 +35,8 @@ The auth proxy sits between your MCP client and the remote MCP server:
 3. Acquires tokens using OAuth `client_credentials` grant
 4. Forwards all MCP requests/responses with `Bearer` authentication
 5. Handles token refresh and 401 retry transparently
+
+If the IdP is temporarily unavailable at startup, the auth proxy will periodically retry OAuth discovery with exponential backoff (5s to 60s) and begin serving requests as soon as discovery succeeds.
 
 ## Quick Start
 
@@ -62,7 +64,7 @@ All configuration via `MCP_CC_PROXY_*` environment variables:
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `MCP_CC_PROXY_REMOTE_MCP_URL` | Yes | — | Remote MCP server URL (use `https://` for production) |
+| `MCP_CC_PROXY_REMOTE_MCP_URL` | Yes | — | Remote MCP server URL (`http://` or `https://`; use `https://` for production) |
 | `MCP_CC_PROXY_CLIENT_ID` | Yes | — | OAuth client_id |
 | `MCP_CC_PROXY_CLIENT_SECRET` | Yes | — | OAuth client_secret |
 | `MCP_CC_PROXY_REFRESH_SKEW_SECONDS` | No | `30` | Proactive refresh window (seconds before token expiry) |
@@ -113,6 +115,7 @@ No configuration is needed; the real client name is introspected from the MCP ha
 
 ### Credential Protection
 - Authorization header always set by the auth proxy, never influenced by MCP client content
+- Auth-like metadata keys (`authorization`, `token`, `bearer`, `access_token`, `client_secret`) stripped from `_meta` in all client-to-server messages (requests and notifications) before forwarding
 - Access tokens stored only in memory, never logged
 - Client secrets loaded at startup, never forwarded or logged
 - All log output redacts token/secret values

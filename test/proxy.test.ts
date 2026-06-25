@@ -136,8 +136,8 @@ describe('Proxy (createProxy integration)', () => {
   });
 
   afterEach(async () => {
-    await endClient?.close().catch(() => {});
     await proxyHandle?.close().catch(() => {});
+    await endClient?.close().catch(() => {});
     for (const s of upstreamServers) {
       await s.close().catch(() => {});
     }
@@ -312,6 +312,35 @@ describe('Proxy (createProxy integration)', () => {
       expect(received).toHaveBeenCalledWith(
         expect.objectContaining({ method: 'notifications/custom/fromclient' }),
       );
+    });
+
+    it('strips auth-like keys from notification _meta before forwarding', async () => {
+      const upstream = getUpstreamServer();
+      let receivedParams: Record<string, unknown> | undefined;
+      upstream.fallbackNotificationHandler = async (notification) => {
+        receivedParams = notification.params as Record<string, unknown>;
+      };
+
+      await endClient.notification({
+        method: 'notifications/custom/withmeta',
+        params: {
+          _meta: {
+            authorization: 'Bearer leaked',
+            token: 'secret-token',
+            client_secret: 'oops',
+            traceparent: '00-trace-id',
+            custom: 'safe',
+          },
+          data: 'payload',
+        },
+      } as Parameters<typeof endClient.notification>[0]);
+
+      await new Promise((r) => setTimeout(r, 100));
+      expect(receivedParams?._meta).not.toHaveProperty('authorization');
+      expect(receivedParams?._meta).not.toHaveProperty('token');
+      expect(receivedParams?._meta).not.toHaveProperty('client_secret');
+      expect(receivedParams?._meta).toHaveProperty('traceparent', '00-trace-id');
+      expect(receivedParams?._meta).toHaveProperty('custom', 'safe');
     });
   });
 

@@ -38,6 +38,11 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
   let authServerMetadata: AuthorizationServerMetadata | undefined;
   let refreshTimer: ReturnType<typeof setTimeout> | undefined;
   let inflightRefresh: Promise<void> | undefined;
+  let rediscoveryTimer: ReturnType<typeof setTimeout> | undefined;
+  let rediscoveryAttempt = 0;
+
+  const REDISCOVERY_BASE_MS = 5000;
+  const REDISCOVERY_MAX_MS = 60000;
 
   const timeoutFetch: typeof globalThis.fetch = (input, init) => {
     const signal = config.requestTimeoutMs
@@ -46,35 +51,87 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
     return fetch(input, { ...init, signal });
   };
 
+  function getRediscoveryDelay(): number {
+    const exponential = Math.min(REDISCOVERY_BASE_MS * 2 ** rediscoveryAttempt, REDISCOVERY_MAX_MS);
+    const jitter = Math.random() * exponential * 0.3;
+    return Math.round(exponential + jitter);
+  }
+
+  function scheduleRediscovery(): void {
+    if (rediscoveryTimer) return;
+    const delayMs = getRediscoveryDelay();
+    logger.info('Scheduling OAuth re-discovery', {
+      attempt: rediscoveryAttempt + 1,
+      delayMs,
+    });
+    rediscoveryTimer = setTimeout(() => {
+      rediscoveryTimer = undefined;
+      void performRediscovery();
+    }, delayMs);
+  }
+
+  async function performRediscovery(): Promise<void> {
+    rediscoveryAttempt++;
+    logger.info('Starting OAuth re-discovery', { attempt: rediscoveryAttempt });
+    try {
+      await discover();
+      if (authMode.type === 'authenticated') {
+        logger.info('OAuth re-discovery succeeded, attempting token prefetch');
+        await prefetch();
+      }
+    } catch (err) {
+      logger.warn('OAuth re-discovery failed', {
+        error: err instanceof Error ? err.message : String(err),
+        attempt: rediscoveryAttempt,
+      });
+    }
+    if (authMode.type === 'discovery-failed') {
+      scheduleRediscovery();
+    }
+  }
+
   async function discover(): Promise<void> {
     const serverUrl = config.remoteMcpUrl;
     logger.info('Starting OAuth discovery', { serverUrl });
 
+    let resourceDiscoveryFailed = false;
     try {
       resourceMetadata = await discoverOAuthProtectedResourceMetadata(serverUrl, {}, timeoutFetch);
     } catch {
       logger.debug('RFC 9728 protected resource metadata not found, trying AS discovery on server URL');
       resourceMetadata = undefined;
+      resourceDiscoveryFailed = true;
     }
 
     const authServerUrl = resourceMetadata?.authorization_servers?.[0] ?? serverUrl;
+    logger.debug('Starting authorization server discovery', { authServerUrl });
 
+    let asDiscoveryFailed = false;
     try {
       authServerMetadata = await discoverAuthorizationServerMetadata(authServerUrl, { fetchFn: timeoutFetch });
-    } catch {
+    } catch (err) {
+      logger.debug('Authorization server discovery failed', {
+        authServerUrl,
+        error: err instanceof Error ? err.message : String(err),
+      });
       authServerMetadata = undefined;
+      asDiscoveryFailed = true;
     }
 
     if (!authServerMetadata) {
+      if (resourceDiscoveryFailed && asDiscoveryFailed) {
+        const msg = 'OAuth discovery failed (both resource and authorization server endpoints unreachable). Requests will be rejected until discovery succeeds.';
+        logger.warn(msg);
+        authMode = { type: 'discovery-failed', message: msg };
+        scheduleRediscovery();
+        return;
+      }
+
       logger.warn(
         'Remote server does not announce auth requirements -- proxying without authentication',
       );
-      if (config.clientId && config.clientSecret) {
-        logger.warn(
-          'Credentials were provided but remote server does not announce auth requirements -- proxying without authentication. Verify the remote server\'s OAuth configuration.',
-        );
-      }
       authMode = { type: 'no-auth' };
+      rediscoveryAttempt = 0;
       return;
     }
 
@@ -99,6 +156,7 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
     installRefreshHook(provider);
 
     authMode = { type: 'authenticated', provider };
+    rediscoveryAttempt = 0;
     logger.info('OAuth discovery complete', {
       tokenEndpoint: authServerMetadata.token_endpoint,
       scopes: currentScopes ?? '(default)',
@@ -195,6 +253,10 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
       clearTimeout(refreshTimer);
       refreshTimer = undefined;
     }
+    if (rediscoveryTimer) {
+      clearTimeout(rediscoveryTimer);
+      rediscoveryTimer = undefined;
+    }
     if (provider) {
       provider.saveTokens({ access_token: '', token_type: 'bearer' });
     }
@@ -205,6 +267,10 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
       clearTimeout(refreshTimer);
       refreshTimer = undefined;
     }
+    if (rediscoveryTimer) {
+      clearTimeout(rediscoveryTimer);
+      rediscoveryTimer = undefined;
+    }
   }
 
   function getAuthProvider(): OAuthClientProvider | undefined {
@@ -214,7 +280,7 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
     return undefined;
   }
 
-  function getAuthMode(): AuthMode {
+  function getAuthMode(): AuthMode {d
     return authMode;
   }
 
