@@ -1,0 +1,65 @@
+{
+  "name": "mcp-client-credentials-auth",
+  "version": "0.1.0",
+  "description": "Local MCP server that authenticates to remote OAuth-protected MCP servers following MCP Auth Specification using client_credentials grant",
+  "main": "dist/index.js",
+  "bin": {
+    "mcp-client-credentials-auth": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "lint": "eslint src/ test/",
+    "lint:fix": "eslint src/ test/ --fix",
+    "prepublishOnly": "npm run lint && npm test && npm run build"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "oauth",
+    "client-credentials",
+    "auth",
+    "model-context-protocol",
+    "stdio",
+    "proxy",
+    "machine-to-machine",
+    "m2m",
+    "autonomous-agents",
+    "ai-agents",
+    "bearer-token",
+    "access-token",
+    "idp",
+    "mcp-auth-specification"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/velias/mcp-client-credentials-auth.git"
+  },
+  "bugs": {
+    "url": "https://github.com/velias/mcp-client-credentials-auth/issues"
+  },
+  "homepage": "https://github.com/velias/mcp-client-credentials-auth#readme",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^22.15.0",
+    "@vitest/coverage-v8": "^4.1.9",
+    "eslint": "^10.2.1",
+    "tsx": "^4.22.4",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.59.0",
+    "vitest": "^4.1.9"
+  }
+}
