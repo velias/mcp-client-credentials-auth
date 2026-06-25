@@ -101,6 +101,7 @@ function createMockTokenManager(mode: AuthMode = { type: 'authenticated', provid
     getAuthProvider: vi.fn().mockReturnValue(mode.type === 'authenticated' ? {} : undefined),
     getAuthMode: vi.fn().mockReturnValue(mode),
     invalidate: vi.fn(),
+    stop: vi.fn(),
   };
 }
 
@@ -394,6 +395,83 @@ describe('Proxy (createProxy integration)', () => {
   describe('close', () => {
     it('shuts down cleanly', async () => {
       await expect(proxyHandle.close()).resolves.not.toThrow();
+    });
+  });
+
+  describe('Reconnection', () => {
+    it('reconnects when remote server disconnects', async () => {
+      const initialConnectCount = connectCount;
+
+      // Close the upstream server to simulate remote disconnect
+      const upstream = getUpstreamServer();
+      await upstream.close();
+
+      // Wait for reconnection to happen
+      await new Promise((r) => setTimeout(r, 300));
+
+      // Should have created a new connection
+      expect(connectCount).toBeGreaterThan(initialConnectCount);
+    });
+
+    it('requests work after reconnection', async () => {
+      // Close the upstream to trigger reconnect
+      const oldUpstream = getUpstreamServer();
+      await oldUpstream.close();
+
+      // Wait for reconnection
+      await new Promise((r) => setTimeout(r, 300));
+
+      // The new upstream should be serving requests
+      const newUpstream = getUpstreamServer();
+      newUpstream.fallbackRequestHandler = async (request) => {
+        if (request.method === 'tools/list') {
+          return {
+            tools: [
+              { name: 'reconnected-tool', description: 'After reconnect', inputSchema: { type: 'object' as const } },
+            ],
+          };
+        }
+        return {};
+      };
+
+      const result = await endClient.listTools();
+      expect(result.tools).toHaveLength(1);
+      expect(result.tools[0].name).toBe('reconnected-tool');
+    });
+
+    it('preserves client identity after reconnection', async () => {
+      const oldUpstream = getUpstreamServer();
+      await oldUpstream.close();
+
+      await new Promise((r) => setTimeout(r, 300));
+
+      const newUpstream = getUpstreamServer();
+      const clientInfo = newUpstream.getClientVersion();
+      expect(clientInfo?.name).toBe('test-client via mcp-client-credentials-auth v0.1.0');
+      expect(clientInfo?.version).toBe('2.5.0');
+    });
+
+    it('preserves client capabilities after reconnection', async () => {
+      const oldUpstream = getUpstreamServer();
+      await oldUpstream.close();
+
+      await new Promise((r) => setTimeout(r, 300));
+
+      const newUpstream = getUpstreamServer();
+      const clientCaps = newUpstream.getClientCapabilities();
+      expect(clientCaps?.sampling).toBeDefined();
+      expect(clientCaps?.roots).toBeDefined();
+    });
+
+    it('does not trigger reconnection during intentional close', async () => {
+      const countBefore = connectCount;
+      await proxyHandle.close();
+
+      await new Promise((r) => setTimeout(r, 200));
+
+      // close() sets reconnecting=true, so onclose should NOT trigger a reconnect
+      // Only the close itself should have run, no new connections
+      expect(connectCount).toBe(countBefore);
     });
   });
 });

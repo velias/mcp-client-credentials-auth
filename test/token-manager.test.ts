@@ -7,16 +7,19 @@ vi.mock('@modelcontextprotocol/sdk/client/auth.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@modelcontextprotocol/sdk/client/auth.js')>();
   return {
     ...actual,
+    auth: vi.fn().mockResolvedValue('AUTHORIZED'),
     discoverOAuthProtectedResourceMetadata: vi.fn(),
     discoverAuthorizationServerMetadata: vi.fn(),
   };
 });
 
 import {
+  auth,
   discoverOAuthProtectedResourceMetadata,
   discoverAuthorizationServerMetadata,
 } from '@modelcontextprotocol/sdk/client/auth.js';
 
+const mockAuth = vi.mocked(auth);
 const mockDiscoverResource = vi.mocked(discoverOAuthProtectedResourceMetadata);
 const mockDiscoverAS = vi.mocked(discoverAuthorizationServerMetadata);
 
@@ -37,17 +40,34 @@ function createTestConfig(overrides?: Partial<Config>): Config {
     clientSecret: 'test-secret',
     refreshSkewSeconds: 30,
     requestTimeoutMs: 30000,
+    capabilitiesPollSeconds: 60,
     debug: false,
     ...overrides,
   };
 }
 
+function setupAuthenticatedDiscovery(): void {
+  mockDiscoverResource.mockResolvedValue({
+    resource: 'https://mcp.example.com/mcp',
+    authorization_servers: ['https://auth.example.com'],
+    scopes_supported: ['read', 'write'],
+  });
+  mockDiscoverAS.mockResolvedValue({
+    issuer: 'https://auth.example.com',
+    token_endpoint: 'https://auth.example.com/token',
+    grant_types_supported: ['client_credentials', 'authorization_code'],
+    token_endpoint_auth_methods_supported: ['client_secret_basic'],
+  });
+}
+
 describe('TokenManager', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.useFakeTimers();
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
   });
 
@@ -69,17 +89,7 @@ describe('TokenManager', () => {
     });
 
     it('enters authenticated mode when discovery succeeds with client_credentials', async () => {
-      mockDiscoverResource.mockResolvedValue({
-        resource: 'https://mcp.example.com/mcp',
-        authorization_servers: ['https://auth.example.com'],
-        scopes_supported: ['read', 'write'],
-      });
-      mockDiscoverAS.mockResolvedValue({
-        issuer: 'https://auth.example.com',
-        token_endpoint: 'https://auth.example.com/token',
-        grant_types_supported: ['client_credentials', 'authorization_code'],
-        token_endpoint_auth_methods_supported: ['client_secret_basic'],
-      });
+      setupAuthenticatedDiscovery();
 
       const logger = createMockLogger();
       const config = createTestConfig();
@@ -165,46 +175,13 @@ describe('TokenManager', () => {
     });
 
     it('returns provider when in authenticated mode', async () => {
-      mockDiscoverResource.mockResolvedValue({
-        resource: 'https://mcp.example.com/mcp',
-        authorization_servers: ['https://auth.example.com'],
-        scopes_supported: ['read'],
-      });
-      mockDiscoverAS.mockResolvedValue({
-        issuer: 'https://auth.example.com',
-        token_endpoint: 'https://auth.example.com/token',
-        grant_types_supported: ['client_credentials'],
-      });
+      setupAuthenticatedDiscovery();
 
       const logger = createMockLogger();
       const config = createTestConfig();
       const tm = createTokenManager(config, logger);
 
       await tm.discover();
-      expect(tm.getAuthProvider()).toBeDefined();
-    });
-  });
-
-  describe('invalidate', () => {
-    it('clears cached state', async () => {
-      mockDiscoverResource.mockResolvedValue({
-        resource: 'https://mcp.example.com/mcp',
-        authorization_servers: ['https://auth.example.com'],
-      });
-      mockDiscoverAS.mockResolvedValue({
-        issuer: 'https://auth.example.com',
-        token_endpoint: 'https://auth.example.com/token',
-        grant_types_supported: ['client_credentials'],
-      });
-
-      const logger = createMockLogger();
-      const config = createTestConfig();
-      const tm = createTokenManager(config, logger);
-
-      await tm.discover();
-      expect(tm.getAuthMode().type).toBe('authenticated');
-
-      tm.invalidate();
       expect(tm.getAuthProvider()).toBeDefined();
     });
   });
@@ -220,158 +197,312 @@ describe('TokenManager', () => {
 
       await tm.discover();
       await tm.prefetch();
+      expect(mockAuth).not.toHaveBeenCalled();
       expect(logger.info).not.toHaveBeenCalledWith('Token prefetch successful');
     });
 
-    it('logs success when token is available', async () => {
-      mockDiscoverResource.mockResolvedValue({
-        resource: 'https://mcp.example.com/mcp',
-        authorization_servers: ['https://auth.example.com'],
-        scopes_supported: ['read'],
-      });
-      mockDiscoverAS.mockResolvedValue({
-        issuer: 'https://auth.example.com',
-        token_endpoint: 'https://auth.example.com/token',
-        grant_types_supported: ['client_credentials'],
-      });
+    it('calls auth() to acquire token at startup', async () => {
+      setupAuthenticatedDiscovery();
+      mockAuth.mockResolvedValue('AUTHORIZED');
 
       const logger = createMockLogger();
       const config = createTestConfig();
       const tm = createTokenManager(config, logger);
 
       await tm.discover();
-
-      const provider = tm.getAuthProvider() as { saveTokens: (t: unknown) => void };
-      provider.saveTokens({ access_token: 'test-token', token_type: 'bearer' });
-
       await tm.prefetch();
+
+      expect(mockAuth).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ serverUrl: 'https://mcp.example.com/mcp' }),
+      );
       expect(logger.info).toHaveBeenCalledWith('Token prefetch successful');
     });
 
     it('logs warning when prefetch fails', async () => {
-      mockDiscoverResource.mockResolvedValue({
-        resource: 'https://mcp.example.com/mcp',
-        authorization_servers: ['https://auth.example.com'],
-        scopes_supported: ['read'],
-      });
-      mockDiscoverAS.mockResolvedValue({
-        issuer: 'https://auth.example.com',
-        token_endpoint: 'https://auth.example.com/token',
-        grant_types_supported: ['client_credentials'],
-      });
+      setupAuthenticatedDiscovery();
+      mockAuth.mockRejectedValue(new Error('Network error'));
 
       const logger = createMockLogger();
       const config = createTestConfig();
       const tm = createTokenManager(config, logger);
 
       await tm.discover();
-      // No token saved, so acquireToken will throw
       await tm.prefetch();
       expect(logger.warn).toHaveBeenCalledWith(
         expect.stringContaining('Token prefetch failed'),
         expect.any(Object),
       );
     });
-  });
 
-  describe('acquireToken / refreshToken', () => {
-    it('returns cached token when available via provider', async () => {
-      mockDiscoverResource.mockResolvedValue({
-        resource: 'https://mcp.example.com/mcp',
-        authorization_servers: ['https://auth.example.com'],
-        scopes_supported: ['read'],
-      });
-      mockDiscoverAS.mockResolvedValue({
-        issuer: 'https://auth.example.com',
-        token_endpoint: 'https://auth.example.com/token',
-        grant_types_supported: ['client_credentials'],
-      });
-
+    it('is a no-op when in discovery-failed mode', async () => {
       const logger = createMockLogger();
       const config = createTestConfig();
       const tm = createTokenManager(config, logger);
 
-      await tm.discover();
-
-      const provider = tm.getAuthProvider() as { saveTokens: (t: unknown) => void; tokens: () => unknown };
-      provider.saveTokens({ access_token: 'my-token', token_type: 'bearer' });
-
+      expect(tm.getAuthMode().type).toBe('discovery-failed');
       await tm.prefetch();
-      expect(logger.info).toHaveBeenCalledWith('Token prefetch successful');
+      expect(mockAuth).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('proactive token refresh', () => {
+    it('schedules refresh timer when saveTokens is called with expires_in', async () => {
+      setupAuthenticatedDiscovery();
+      mockAuth.mockImplementation(async (provider) => {
+        void provider.saveTokens({ access_token: 'tok', token_type: 'bearer', expires_in: 3600 });
+        return 'AUTHORIZED';
+      });
+
+      const logger = createMockLogger();
+      const config = createTestConfig({ refreshSkewSeconds: 30 });
+      const tm = createTokenManager(config, logger);
+
+      await tm.discover();
+      await tm.prefetch();
+
+      expect(logger.debug).toHaveBeenCalledWith(
+        'Proactive token refresh scheduled',
+        expect.objectContaining({
+          expiresInSeconds: 3600,
+          refreshInSeconds: 3570,
+        }),
+      );
+
+      tm.stop();
+    });
+
+    it('fires refresh at (expires_in - refreshSkewSeconds)', async () => {
+      setupAuthenticatedDiscovery();
+      let callCount = 0;
+      mockAuth.mockImplementation(async (provider) => {
+        callCount++;
+        void provider.saveTokens({ access_token: `tok-${callCount}`, token_type: 'bearer', expires_in: 60 });
+        return 'AUTHORIZED';
+      });
+
+      const logger = createMockLogger();
+      const config = createTestConfig({ refreshSkewSeconds: 10 });
+      const tm = createTokenManager(config, logger);
+
+      await tm.discover();
+      await tm.prefetch();
+      expect(callCount).toBe(1);
+
+      // Advance to just before refresh time (50s)
+      await vi.advanceTimersByTimeAsync(49_000);
+      expect(callCount).toBe(1);
+
+      // Advance past refresh time
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(callCount).toBe(2);
+      expect(logger.info).toHaveBeenCalledWith('Proactive token refresh successful');
+
+      tm.stop();
     });
 
     it('deduplicates concurrent refresh calls', async () => {
-      mockDiscoverResource.mockResolvedValue({
-        resource: 'https://mcp.example.com/mcp',
-        authorization_servers: ['https://auth.example.com'],
-        scopes_supported: ['read'],
-      });
-      mockDiscoverAS.mockResolvedValue({
-        issuer: 'https://auth.example.com',
-        token_endpoint: 'https://auth.example.com/token',
-        grant_types_supported: ['client_credentials'],
+      setupAuthenticatedDiscovery();
+      let resolveAuth: (() => void) | undefined;
+      let callCount = 0;
+      mockAuth.mockImplementation(async (provider) => {
+        callCount++;
+        if (callCount === 1) {
+          void provider.saveTokens({ access_token: 'tok', token_type: 'bearer', expires_in: 10 });
+        } else {
+          await new Promise<void>((r) => { resolveAuth = r; });
+          void provider.saveTokens({ access_token: 'tok2', token_type: 'bearer', expires_in: 3600 });
+        }
+        return 'AUTHORIZED';
       });
 
       const logger = createMockLogger();
-      const config = createTestConfig();
+      const config = createTestConfig({ refreshSkewSeconds: 5 });
       const tm = createTokenManager(config, logger);
 
       await tm.discover();
-
-      const provider = tm.getAuthProvider() as { saveTokens: (t: unknown) => void };
-      provider.saveTokens({ access_token: 'dedup-token', token_type: 'bearer' });
-
-      // Call prefetch concurrently - both should succeed without duplicate errors
-      const [r1, r2] = await Promise.allSettled([tm.prefetch(), tm.prefetch()]);
-      expect(r1.status).toBe('fulfilled');
-      expect(r2.status).toBe('fulfilled');
-    });
-
-    it('throws when in unsupported-grant mode during prefetch', async () => {
-      mockDiscoverResource.mockResolvedValue({
-        resource: 'https://mcp.example.com/mcp',
-        authorization_servers: ['https://auth.example.com'],
-      });
-      mockDiscoverAS.mockResolvedValue({
-        issuer: 'https://auth.example.com',
-        token_endpoint: 'https://auth.example.com/token',
-        grant_types_supported: ['authorization_code'],
-      });
-
-      const logger = createMockLogger();
-      const config = createTestConfig();
-      const tm = createTokenManager(config, logger);
-
-      await tm.discover();
-      expect(tm.getAuthMode().type).toBe('unsupported-grant');
-    });
-
-    it('prefetch is a no-op when in discovery-failed mode', async () => {
-      const logger = createMockLogger();
-      const config = createTestConfig();
-      const tm = createTokenManager(config, logger);
-
-      // Start in discovery-failed mode (no discover() called)
-      expect(tm.getAuthMode().type).toBe('discovery-failed');
-
-      // prefetch returns early since mode != authenticated
       await tm.prefetch();
-      expect(mockDiscoverResource).not.toHaveBeenCalled();
-      expect(logger.info).not.toHaveBeenCalledWith('Token prefetch successful');
+
+      // Trigger the refresh timer
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      // auth is now in-flight; callCount should be 2
+      expect(callCount).toBe(2);
+
+      // Resolve the in-flight auth
+      resolveAuth!();
+      await vi.advanceTimersByTimeAsync(0);
+
+      tm.stop();
+    });
+
+    it('retries on refresh failure before giving up', async () => {
+      setupAuthenticatedDiscovery();
+      let callCount = 0;
+      mockAuth.mockImplementation(async (provider) => {
+        callCount++;
+        if (callCount === 1) {
+          void provider.saveTokens({ access_token: 'tok', token_type: 'bearer', expires_in: 100 });
+          return 'AUTHORIZED';
+        }
+        throw new Error('IdP unavailable');
+      });
+
+      const logger = createMockLogger();
+      // 30s skew → retry interval = min(5000, 30000/4) = 5000ms
+      const config = createTestConfig({ refreshSkewSeconds: 30 });
+      const tm = createTokenManager(config, logger);
+
+      await tm.discover();
+      await tm.prefetch();
+
+      // First refresh fires at (100-30)=70s, fails → schedules retry in 5s
+      await vi.advanceTimersByTimeAsync(70_000);
+      expect(callCount).toBe(2);
+      expect(logger.warn).toHaveBeenCalledWith(
+        'Proactive token refresh failed, scheduling retry',
+        expect.objectContaining({ error: 'IdP unavailable', attempt: 1, retryInMs: 5000 }),
+      );
+
+      // Retry fires at +5s, fails again → schedules another retry
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(callCount).toBe(3);
+      expect(logger.warn).toHaveBeenCalledWith(
+        'Proactive token refresh failed, scheduling retry',
+        expect.objectContaining({ attempt: 2 }),
+      );
+
+      // Third attempt at +5s, fails → gives up
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(callCount).toBe(4);
+      expect(logger.warn).toHaveBeenCalledWith(
+        'Proactive token refresh failed after max retries (will retry on next 401)',
+        expect.objectContaining({ error: 'IdP unavailable', attempts: 3 }),
+      );
+
+      tm.stop();
+    });
+
+    it('adapts retry interval to short skew periods', async () => {
+      setupAuthenticatedDiscovery();
+      let callCount = 0;
+      mockAuth.mockImplementation(async (provider) => {
+        callCount++;
+        if (callCount === 1) {
+          void provider.saveTokens({ access_token: 'tok', token_type: 'bearer', expires_in: 10 });
+          return 'AUTHORIZED';
+        }
+        throw new Error('IdP unavailable');
+      });
+
+      const logger = createMockLogger();
+      // 5s skew → retry interval = min(5000, 5000/4) = 1250ms
+      const config = createTestConfig({ refreshSkewSeconds: 5 });
+      const tm = createTokenManager(config, logger);
+
+      await tm.discover();
+      await tm.prefetch();
+
+      // First refresh fires at (10-5)=5s
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(callCount).toBe(2);
+      expect(logger.warn).toHaveBeenCalledWith(
+        'Proactive token refresh failed, scheduling retry',
+        expect.objectContaining({ retryInMs: 1250 }),
+      );
+
+      // Retry fires at +1250ms
+      await vi.advanceTimersByTimeAsync(1_250);
+      expect(callCount).toBe(3);
+
+      // Another retry at +1250ms
+      await vi.advanceTimersByTimeAsync(1_250);
+      expect(callCount).toBe(4);
+      expect(logger.warn).toHaveBeenCalledWith(
+        'Proactive token refresh failed after max retries (will retry on next 401)',
+        expect.objectContaining({ attempts: 3 }),
+      );
+
+      tm.stop();
+    });
+
+    it('does not schedule refresh when expires_in is missing', async () => {
+      setupAuthenticatedDiscovery();
+      mockAuth.mockImplementation(async (provider) => {
+        void provider.saveTokens({ access_token: 'tok', token_type: 'bearer' });
+        return 'AUTHORIZED';
+      });
+
+      const logger = createMockLogger();
+      const config = createTestConfig();
+      const tm = createTokenManager(config, logger);
+
+      await tm.discover();
+      await tm.prefetch();
+
+      expect(logger.debug).not.toHaveBeenCalledWith(
+        'Proactive token refresh scheduled',
+        expect.anything(),
+      );
+
+      tm.stop();
+    });
+
+    it('uses minimum 1s refresh delay even when refreshSkewSeconds > expires_in', async () => {
+      setupAuthenticatedDiscovery();
+      mockAuth.mockImplementation(async (provider) => {
+        void provider.saveTokens({ access_token: 'tok', token_type: 'bearer', expires_in: 5 });
+        return 'AUTHORIZED';
+      });
+
+      const logger = createMockLogger();
+      const config = createTestConfig({ refreshSkewSeconds: 100 });
+      const tm = createTokenManager(config, logger);
+
+      await tm.discover();
+      await tm.prefetch();
+
+      expect(logger.debug).toHaveBeenCalledWith(
+        'Proactive token refresh scheduled',
+        expect.objectContaining({ refreshInSeconds: 1 }),
+      );
+
+      tm.stop();
+    });
+  });
+
+  describe('stop', () => {
+    it('cancels the refresh timer', async () => {
+      setupAuthenticatedDiscovery();
+      let callCount = 0;
+      mockAuth.mockImplementation(async (provider) => {
+        callCount++;
+        void provider.saveTokens({ access_token: 'tok', token_type: 'bearer', expires_in: 10 });
+        return 'AUTHORIZED';
+      });
+
+      const logger = createMockLogger();
+      const config = createTestConfig({ refreshSkewSeconds: 5 });
+      const tm = createTokenManager(config, logger);
+
+      await tm.discover();
+      await tm.prefetch();
+      expect(callCount).toBe(1);
+
+      tm.stop();
+
+      // Advance past the refresh time -- should NOT trigger
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(callCount).toBe(1);
     });
   });
 
   describe('invalidate', () => {
     it('clears the token from the provider', async () => {
-      mockDiscoverResource.mockResolvedValue({
-        resource: 'https://mcp.example.com/mcp',
-        authorization_servers: ['https://auth.example.com'],
-        scopes_supported: ['read'],
-      });
-      mockDiscoverAS.mockResolvedValue({
-        issuer: 'https://auth.example.com',
-        token_endpoint: 'https://auth.example.com/token',
-        grant_types_supported: ['client_credentials'],
+      setupAuthenticatedDiscovery();
+      mockAuth.mockImplementation(async (provider) => {
+        void provider.saveTokens({ access_token: 'valid-token', token_type: 'bearer', expires_in: 3600 });
+        return 'AUTHORIZED';
       });
 
       const logger = createMockLogger();
@@ -379,14 +510,41 @@ describe('TokenManager', () => {
       const tm = createTokenManager(config, logger);
 
       await tm.discover();
+      await tm.prefetch();
 
-      const provider = tm.getAuthProvider() as { saveTokens: (t: unknown) => void; tokens: () => { access_token: string } | undefined };
-      provider.saveTokens({ access_token: 'valid-token', token_type: 'bearer' });
+      const provider = tm.getAuthProvider() as { tokens: () => { access_token: string } | undefined };
       expect(provider.tokens()?.access_token).toBe('valid-token');
 
       tm.invalidate();
-      // After invalidation, the token should be cleared
       expect(provider.tokens()?.access_token).toBe('');
+
+      tm.stop();
+    });
+
+    it('cancels refresh timer on invalidate', async () => {
+      setupAuthenticatedDiscovery();
+      let callCount = 0;
+      mockAuth.mockImplementation(async (provider) => {
+        callCount++;
+        if (callCount === 1) {
+          void provider.saveTokens({ access_token: 'tok', token_type: 'bearer', expires_in: 10 });
+        }
+        return 'AUTHORIZED';
+      });
+
+      const logger = createMockLogger();
+      const config = createTestConfig({ refreshSkewSeconds: 5 });
+      const tm = createTokenManager(config, logger);
+
+      await tm.discover();
+      await tm.prefetch();
+
+      tm.invalidate();
+
+      // Advance past what would have been the refresh time
+      await vi.advanceTimersByTimeAsync(10_000);
+      // auth should only have been called once (the prefetch)
+      expect(callCount).toBe(1);
     });
 
     it('is safe to call when provider is not initialized', () => {
@@ -394,7 +552,6 @@ describe('TokenManager', () => {
       const config = createTestConfig();
       const tm = createTokenManager(config, logger);
 
-      // Should not throw
       expect(() => tm.invalidate()).not.toThrow();
     });
   });

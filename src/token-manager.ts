@@ -2,12 +2,14 @@ import {
   ClientCredentialsProvider,
 } from '@modelcontextprotocol/sdk/client/auth-extensions.js';
 import {
+  auth,
   discoverOAuthProtectedResourceMetadata,
   discoverAuthorizationServerMetadata,
   type OAuthClientProvider,
 } from '@modelcontextprotocol/sdk/client/auth.js';
 import type {
   OAuthProtectedResourceMetadata,
+  OAuthTokens,
   AuthorizationServerMetadata,
 } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { Config } from './config.js';
@@ -25,22 +27,31 @@ export interface TokenManager {
   getAuthProvider(): OAuthClientProvider | undefined;
   getAuthMode(): AuthMode;
   invalidate(): void;
+  stop(): void;
 }
 
 export function createTokenManager(config: Config, logger: Logger): TokenManager {
   let authMode: AuthMode = { type: 'discovery-failed', message: 'Discovery not attempted yet' };
   let provider: ClientCredentialsProvider | undefined;
-  let cachedToken: string | undefined;
-  let inflight: Promise<string> | undefined;
   let currentScopes: string | undefined;
   let resourceMetadata: OAuthProtectedResourceMetadata | undefined;
   let authServerMetadata: AuthorizationServerMetadata | undefined;
+  let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+  let inflightRefresh: Promise<void> | undefined;
+
+  const timeoutFetch: typeof globalThis.fetch = (input, init) => {
+    const signal = config.requestTimeoutMs
+      ? AbortSignal.timeout(config.requestTimeoutMs)
+      : undefined;
+    return fetch(input, { ...init, signal });
+  };
 
   async function discover(): Promise<void> {
     const serverUrl = config.remoteMcpUrl;
+    logger.info('Starting OAuth discovery', { serverUrl });
 
     try {
-      resourceMetadata = await discoverOAuthProtectedResourceMetadata(serverUrl);
+      resourceMetadata = await discoverOAuthProtectedResourceMetadata(serverUrl, {}, timeoutFetch);
     } catch {
       logger.debug('RFC 9728 protected resource metadata not found, trying AS discovery on server URL');
       resourceMetadata = undefined;
@@ -49,7 +60,7 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
     const authServerUrl = resourceMetadata?.authorization_servers?.[0] ?? serverUrl;
 
     try {
-      authServerMetadata = await discoverAuthorizationServerMetadata(authServerUrl);
+      authServerMetadata = await discoverAuthorizationServerMetadata(authServerUrl, { fetchFn: timeoutFetch });
     } catch {
       authServerMetadata = undefined;
     }
@@ -85,6 +96,8 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
       ...(currentScopes ? { scope: currentScopes } : {}),
     });
 
+    installRefreshHook(provider);
+
     authMode = { type: 'authenticated', provider };
     logger.info('OAuth discovery complete', {
       tokenEndpoint: authServerMetadata.token_endpoint,
@@ -92,58 +105,83 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
     });
   }
 
-  async function acquireToken(): Promise<string> {
-    if (authMode.type === 'no-auth') {
-      return '';
-    }
-    if (authMode.type === 'unsupported-grant') {
-      throw new Error(authMode.message);
-    }
-    if (authMode.type === 'discovery-failed') {
-      await discover();
-      return acquireToken();
-    }
-
-    if (!provider) {
-      throw new Error('TokenManager: provider not initialized');
-    }
-
-    const existingTokens = provider.tokens();
-    if (existingTokens?.access_token) {
-      cachedToken = existingTokens.access_token;
-      return cachedToken;
-    }
-
-    throw new Error('Token acquisition failed: no token available after auth flow');
+  function installRefreshHook(p: ClientCredentialsProvider): void {
+    const originalSaveTokens = p.saveTokens.bind(p);
+    p.saveTokens = (tokens: OAuthTokens) => {
+      originalSaveTokens(tokens);
+      scheduleRefresh(tokens.expires_in);
+    };
   }
 
-  async function refreshToken(): Promise<string> {
-    if (!inflight) {
-      inflight = doRefresh().finally(() => {
-        inflight = undefined;
-      });
+  function scheduleRefresh(expiresIn?: number): void {
+    if (refreshTimer) {
+      clearTimeout(refreshTimer);
+      refreshTimer = undefined;
     }
-    return inflight;
+    if (!expiresIn || expiresIn <= 0) return;
+
+    const refreshInMs = Math.max((expiresIn - config.refreshSkewSeconds) * 1000, 1000);
+    refreshTimer = setTimeout(() => void doProactiveRefresh(), refreshInMs);
+    logger.debug('Proactive token refresh scheduled', {
+      expiresInSeconds: expiresIn,
+      refreshInSeconds: Math.round(refreshInMs / 1000),
+    });
   }
 
-  async function doRefresh(): Promise<string> {
+  async function doProactiveRefresh(): Promise<void> {
+    if (inflightRefresh) return;
+    inflightRefresh = performRefresh().finally(() => { inflightRefresh = undefined; });
+    await inflightRefresh;
+  }
+
+  const MAX_REFRESH_RETRIES = 3;
+  let refreshRetryCount = 0;
+
+  function getRetryIntervalMs(): number {
+    const skewMs = config.refreshSkewSeconds * 1000;
+    // Distribute retries evenly within the skew window
+    return Math.max(Math.min(5_000, Math.floor(skewMs / (MAX_REFRESH_RETRIES + 1))), 500);
+  }
+
+  async function performRefresh(): Promise<void> {
+    if (!provider) return;
+    logger.debug('Starting proactive token refresh');
     try {
-      const token = await acquireToken();
-      return token;
+      const result = await auth(provider, { serverUrl: config.remoteMcpUrl, fetchFn: timeoutFetch });
+      if (result === 'AUTHORIZED') {
+        logger.info('Proactive token refresh successful');
+        refreshRetryCount = 0;
+      }
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      logger.error('Token acquisition failed', { error: message });
-      throw err;
+      refreshRetryCount++;
+      if (refreshRetryCount < MAX_REFRESH_RETRIES) {
+        const retryMs = getRetryIntervalMs();
+        logger.warn('Proactive token refresh failed, scheduling retry', {
+          error: err instanceof Error ? err.message : String(err),
+          attempt: refreshRetryCount,
+          maxAttempts: MAX_REFRESH_RETRIES,
+          retryInMs: retryMs,
+        });
+        refreshTimer = setTimeout(() => void doProactiveRefresh(), retryMs);
+      } else {
+        logger.warn('Proactive token refresh failed after max retries (will retry on next 401)', {
+          error: err instanceof Error ? err.message : String(err),
+          attempts: refreshRetryCount,
+        });
+        refreshRetryCount = 0;
+      }
     }
   }
 
   async function prefetch(): Promise<void> {
-    if (authMode.type !== 'authenticated') {
+    if (authMode.type !== 'authenticated' || !provider) {
       return;
     }
     try {
-      await refreshToken();
-      logger.info('Token prefetch successful');
+      const result = await auth(provider, { serverUrl: config.remoteMcpUrl, fetchFn: timeoutFetch });
+      if (result === 'AUTHORIZED') {
+        logger.info('Token prefetch successful');
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       logger.warn('Token prefetch failed (will retry on first request)', {
@@ -153,9 +191,19 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
   }
 
   function invalidate(): void {
-    cachedToken = undefined;
+    if (refreshTimer) {
+      clearTimeout(refreshTimer);
+      refreshTimer = undefined;
+    }
     if (provider) {
       provider.saveTokens({ access_token: '', token_type: 'bearer' });
+    }
+  }
+
+  function stop(): void {
+    if (refreshTimer) {
+      clearTimeout(refreshTimer);
+      refreshTimer = undefined;
     }
   }
 
@@ -176,5 +224,6 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
     getAuthProvider,
     getAuthMode,
     invalidate,
+    stop,
   };
 }

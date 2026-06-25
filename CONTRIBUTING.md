@@ -2,7 +2,7 @@
 
 Thank you for considering contributing! This document explains the process and guidelines for contributing to this project.
 
-For detailed architecture notes, performance conventions, and implementation patterns, see [AGENTS.md](AGENTS.md) — it is maintained as the single source of truth for how the codebase is structured and why.
+For architecture, code style, logging, and testing conventions, see [AGENTS.md](AGENTS.md).
 
 ## How to Contribute
 
@@ -33,17 +33,10 @@ For detailed architecture notes, performance conventions, and implementation pat
 
 ### PR titles and labels (for release notes)
 
-GitHub Release notes are **auto-generated from merged PRs**. To keep them useful:
+Release notes are auto-generated from merged PRs (see [RELEASING.md](RELEASING.md) for details). As a contributor:
 
-- **Write a clear PR title** — it appears verbatim in the release notes (along with the PR author). The PR body/description is _not_ included.
-- **Apply a label** to categorize the PR in release notes. Use one of:
-  - `breaking` — breaking changes
-  - `enhancement` or `feature` — new functionality
-  - `bug` or `fix` — bug fixes
-  - `documentation` — docs-only changes
-  - Unlabeled PRs land in "Other Changes"
-- Labels can be added or changed **at any time** before the release is created — they don't need to be set at merge time.
-- All meaningful changes should go through PRs. Direct commits to `main` appear as raw commit hashes in release notes.
+- **Write a clear PR title** — it appears verbatim in the release notes.
+- **Apply a label**: `breaking`, `enhancement`/`feature`, `bug`/`fix`, or `documentation`. Unlabeled PRs land in "Other Changes".
 
 ## Development Setup
 
@@ -138,7 +131,7 @@ ESLint uses [typescript-eslint](https://typescript-eslint.io/) with type-aware r
 
 ## Code Style, Testing & Architecture
 
-See the **Code style**, **Testing conventions**, and **Performance conventions** sections in [AGENTS.md](AGENTS.md) for the full guidelines.
+See [AGENTS.md](AGENTS.md).
 
 ## Releases
 

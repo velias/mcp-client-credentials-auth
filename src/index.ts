@@ -68,6 +68,7 @@ async function main(): Promise<void> {
 
   const shutdown = async (signal: string) => {
     logger.info(`Received ${signal}, shutting down`);
+    tokenManager.stop();
     await proxy.close();
     process.exit(0);
   };

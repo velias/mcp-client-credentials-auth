@@ -24,22 +24,29 @@ src/
   proxy.ts             # Wire local Server <-> remote Client
 test/
   config.test.ts       # Config parsing, validation, defaults
-  token-manager.test.ts # Discovery, auth modes, invalidation
-  proxy.test.ts        # E2E with in-memory MCP transports
+  token-manager.test.ts # Discovery, auth modes, prefetch, proactive refresh
+  proxy.test.ts        # E2E with in-memory MCP transports, reconnection
 ```
 
 ## Architecture Notes
 
-- **stdio reserved for JSON-RPC** -- all logging goes to stderr
+- **stdio reserved for JSON-RPC** -- all proxy logging goes to stderr (`logger.ts`), never stdout. The MCP protocol's own `notifications/message` logging from the remote server passes through to the local client via fallback handlers. The proxy does not inject its own MCP-level log notifications because it mirrors the remote server's declared capabilities (including whether `logging` is supported).
+- **Two-phase connection** -- discovery connection gets remote server info, then a real connection is established with the local client's actual identity/capabilities after the local handshake completes
 - **Protocol-version agnostic** -- uses SDK fallback handlers for bidirectional pass-through
 - **No hardcoded method tables** -- all 4 message flows use `fallbackRequestHandler`/`fallbackNotificationHandler`
 - **`_meta` sanitization** -- auth-like keys stripped before forwarding to remote
 - **Transport fallback** -- Streamable HTTP first, SSE if that fails
+- **Automatic reconnection** -- detects remote `onclose`, reconnects with stored identity/capabilities, restarts polling
+- **Local disconnect cleanup** -- detects `localServer.onclose` (stdin closed) and exits cleanly
+- **Timeouts on all outgoing calls** -- `requestTimeoutMs` applied via `AbortSignal.timeout` to MCP requests, OAuth discovery, and token acquisition
+- **Proactive refresh via `saveTokens` hook** -- monkey-patches `ClientCredentialsProvider.saveTokens` to schedule a timer; this is a deliberate coupling to SDK internals (see upgrade checklist)
 
 ## Performance Conventions
 
-- Token cached in memory with proactive refresh (no on-demand latency)
-- In-flight de-duplication prevents thundering herd on token endpoint
+- Token cached in memory with proactive refresh timer (`refreshSkewSeconds` before expiry)
+- Proactive refresh retries up to 3 times (interval adapts to fit within skew window) before falling back to reactive 401 handling
+- `prefetch()` acquires a real token at startup via `auth()` so the first request never hits a cold path
+- Proactive refresh deduplication (`inflightRefresh`) prevents concurrent refresh attempts
 - Single process, no worker threads needed
 
 ## Code Style
@@ -51,6 +58,25 @@ test/
 - Error messages: human-readable, include actionable context
 - Do not use `--` (double dash) as em-dash in `README.md`; use proper punctuation (semicolons, commas, or separate sentences). `--` is acceptable in code, comments, and internal docs like AGENTS.md.
 
+## Logging Conventions
+
+All logging goes to stderr via `logger.ts`. stdout is reserved for JSON-RPC.
+
+### Level guidelines
+
+- **ERROR** -- unrecoverable failures that stop a flow (connection failed permanently, cannot start proxy)
+- **WARN** -- degraded state that the proxy can recover from or work around (refresh failed but will retry, poll failed, transport fallback to SSE)
+- **INFO** -- key lifecycle events visible without debug mode (startup, connected, reconnected, shutdown, capability changes, OAuth discovery result)
+- **DEBUG** -- verbose details only useful when actively debugging (per-message forwarding, timer scheduling, internal state transitions)
+
+### Patterns
+
+- **Before+after for network calls**: every outgoing call that could hang should have a log BEFORE it starts (at INFO for startup-path calls, DEBUG for recurring calls like refresh) and a log on completion/failure. This lets you see where things get stuck.
+- **No success log without a corresponding start log**: if you log "X successful", there must be a preceding "Starting X" or "Attempting X" so silence between them is visible.
+- **Actionable context in warnings/errors**: include what will happen next ("will retry on first request", "scheduling retry", "proxy will stop").
+- **Never log secrets**: the logger redacts values for keys matching secret patterns (token, secret, authorization, etc.). Do not pass raw tokens as the `msg` argument; put them in the `meta` object where redaction applies.
+- **Structured metadata**: pass context as the second argument `meta` object, not interpolated into the message string. This keeps logs parseable.
+
 ## Testing Conventions
 
 - All tests use Vitest with `globals: true`
@@ -58,3 +84,40 @@ test/
 - Use `InMemoryTransport` from SDK for proxy integration tests
 - No real network calls in tests
 - Test file naming: `test/<module>.test.ts`
+
+## MCP SDK Upgrade Checklist
+
+When bumping `@modelcontextprotocol/sdk`, check the following areas where the proxy depends on SDK internals or undocumented behaviors:
+
+### Authentication flow (`token-manager.ts`)
+
+- **`auth()` function signature** -- we call `auth(provider, { serverUrl, fetchFn })` directly. If the options shape or return type (`AuthResult`) changes, `prefetch()` and `performRefresh()` break.
+- **`ClientCredentialsProvider.saveTokens`** -- we monkey-patch `saveTokens` to intercept token storage and schedule proactive refresh. If the provider's token lifecycle changes (e.g., refresh handled internally), our hook may become redundant or conflict.
+- **`OAuthTokens.expires_in`** -- our proactive refresh depends on `expires_in` being passed through `saveTokens`. If the SDK starts consuming/removing it before calling `saveTokens`, our timer won't schedule.
+- **Discovery functions** -- `discoverOAuthProtectedResourceMetadata` and `discoverAuthorizationServerMetadata` signatures (especially the `fetchFn` parameter position).
+
+### Transport layer (`proxy.ts`)
+
+- **`StreamableHTTPClientTransport` options** -- we pass `{ authProvider, requestInit: { signal } }`. Check if the options type changes or if `requestInit.signal` handling is altered.
+- **`SSEClientTransport` options** -- same pattern with `authProvider` and `requestInit`.
+- **`Client.onclose`** -- we rely on `onclose` firing when the remote transport disconnects. If the SDK changes to an event emitter or renames this, reconnection breaks.
+- **`Client.connect()` re-entrancy** -- we create a new `Client` instance for each reconnection. Verify the SDK doesn't introduce singleton restrictions or session ID reuse that would prevent this.
+- **401 retry behavior** -- the SDK's transport handles 401 responses by calling `auth()` internally. Our proactive refresh reduces how often this path is hit, but if the SDK removes automatic 401 retry, requests will fail when proactive refresh is late.
+
+### Protocol abstractions (`proxy.ts`)
+
+- **`fallbackRequestHandler` / `fallbackNotificationHandler`** -- our entire pass-through design depends on these catch-all handlers. If the SDK removes them or changes precedence (e.g., registered handlers always win), proxying breaks.
+- **`Server.request()` / `Server.notification()`** -- we use these to forward messages from remote to local. Check that they still accept arbitrary method strings.
+- **`getServerCapabilities()` / `getClientCapabilities()`** -- used for identity/capability forwarding. These should remain available after `connect()`.
+- **`sendToolListChanged` / `sendResourceListChanged` / `sendPromptListChanged`** -- we call these to notify the local client of changes. If the SDK renames or gates them behind capability checks, polling notifications break.
+
+### Known SDK issues to re-check
+
+- **Scope step-up bugs** ([#1582](https://github.com/modelcontextprotocol/typescript-sdk/issues/1582), [#2255](https://github.com/modelcontextprotocol/typescript-sdk/issues/2255)) -- if fixed upstream, we can remove the "Known Issues" section from README and potentially remove the workaround note.
+- **`SSEClientTransport` deprecation** -- the SDK marks it deprecated. If removed entirely, delete our SSE fallback code.
+
+### How to verify
+
+1. `npm run build` -- catches type-level breakage
+2. `npm test` -- proxy tests exercise all 4 message flows, reconnection, and identity forwarding via mocked SDK transports
+3. Manual test with a real remote MCP server -- confirms auth flow, transport negotiation, and token refresh work end-to-end (not covered by unit tests)

@@ -71,6 +71,7 @@ export async function createProxy(
     { capabilities: {} },
   );
 
+  logger.info('Connecting to remote MCP server for discovery', { url: config.remoteMcpUrl });
   try {
     const httpTransport = new StreamableHTTPClientTransport(remoteUrl, {
       authProvider,
@@ -79,13 +80,18 @@ export async function createProxy(
         : {}),
     });
     await discoveryClient.connect(httpTransport);
-    logger.info('Discovery: connected to remote MCP server via Streamable HTTP');
+    logger.info('Discovery: connected via Streamable HTTP');
   } catch (httpErr) {
-    logger.debug('Streamable HTTP connection failed, trying SSE fallback', {
+    logger.info('Streamable HTTP connection failed, trying SSE fallback', {
       error: httpErr instanceof Error ? httpErr.message : String(httpErr),
     });
     try {
-      const sseTransport = new SSEClientTransport(remoteUrl, { authProvider });
+      const sseTransport = new SSEClientTransport(remoteUrl, {
+        authProvider,
+        ...(config.requestTimeoutMs
+          ? { requestInit: { signal: AbortSignal.timeout(config.requestTimeoutMs) } }
+          : {}),
+      });
       await discoveryClient.connect(sseTransport);
       logger.info('Discovery: connected to remote MCP server via SSE');
     } catch (sseErr) {
@@ -120,6 +126,7 @@ export async function createProxy(
     identity: Implementation,
     capabilities: ClientCapabilities,
   ): Promise<Client> {
+    logger.debug('Connecting to remote MCP server', { clientName: identity.name });
     const client = new Client(identity, { capabilities });
 
     try {
@@ -134,10 +141,15 @@ export async function createProxy(
         clientName: identity.name,
       });
     } catch (httpErr) {
-      logger.debug('Streamable HTTP failed, trying SSE fallback', {
+      logger.info('Streamable HTTP failed, trying SSE fallback', {
         error: httpErr instanceof Error ? httpErr.message : String(httpErr),
       });
-      const sseTransport = new SSEClientTransport(remoteUrl, { authProvider });
+      const sseTransport = new SSEClientTransport(remoteUrl, {
+        authProvider,
+        ...(config.requestTimeoutMs
+          ? { requestInit: { signal: AbortSignal.timeout(config.requestTimeoutMs) } }
+          : {}),
+      });
       await client.connect(sseTransport);
       logger.info('Connected to remote MCP server via SSE', {
         clientName: identity.name,
@@ -186,9 +198,53 @@ export async function createProxy(
       if (caps.resources) await localServer.sendResourceListChanged();
       if (caps.prompts) await localServer.sendPromptListChanged();
     } catch (err) {
-      logger.debug('Failed to send list changed notifications', {
+      logger.warn('Failed to send list changed notifications', {
         error: err instanceof Error ? err.message : String(err),
       });
+    }
+  }
+
+  let storedIdentity: Implementation | undefined;
+  let storedCapabilities: ClientCapabilities | undefined;
+  let reconnecting = false;
+
+  function wireOnClose(client: Client): void {
+    client.onclose = () => {
+      if (reconnecting) return;
+      logger.warn('Remote connection lost, attempting reconnection');
+      void reconnect();
+    };
+  }
+
+  async function reconnect(): Promise<void> {
+    reconnecting = true;
+    stopPolling();
+    remoteClient = undefined;
+
+    if (!storedIdentity || !storedCapabilities) {
+      logger.error('Cannot reconnect: no stored identity/capabilities');
+      reconnecting = false;
+      return;
+    }
+
+    try {
+      remoteClient = await connectRemote(storedIdentity, storedCapabilities);
+      wireRemoteHandlers(remoteClient);
+      wireOnClose(remoteClient);
+
+      const newCaps = remoteClient.getServerCapabilities() ?? {};
+      checkCapabilityChanges(newCaps);
+      await notifyListChanges(newCaps);
+
+      startPolling();
+      logger.info('Reconnection successful');
+    } catch (err) {
+      logger.error('Reconnection failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      remoteClient = undefined;
+    } finally {
+      reconnecting = false;
     }
   }
 
@@ -198,6 +254,9 @@ export async function createProxy(
 
     const identity = buildClientIdentity(localClientInfo);
     const capabilities = localClientCaps;
+
+    storedIdentity = identity;
+    storedCapabilities = capabilities;
 
     logger.info('Local client initialized', {
       clientName: localClientInfo?.name,
@@ -209,6 +268,7 @@ export async function createProxy(
       try {
         remoteClient = await connectRemote(identity, capabilities);
         wireRemoteHandlers(remoteClient);
+        wireOnClose(remoteClient);
 
         const newCaps = remoteClient.getServerCapabilities() ?? {};
         checkCapabilityChanges(newCaps);
@@ -264,8 +324,28 @@ export async function createProxy(
   await localServer.connect(stdioTransport);
   logger.info('Local MCP server started on stdio');
 
+  let closingIntentionally = false;
+
+  localServer.onclose = () => {
+    if (closingIntentionally) return;
+    logger.info('Local client disconnected, shutting down');
+    reconnecting = true;
+    stopPolling();
+    if (remoteClient) {
+      void remoteClient.close();
+    }
+    process.exit(0);
+  };
+
   // Capabilities polling
   let pollInterval: ReturnType<typeof setInterval> | undefined;
+
+  function stopPolling(): void {
+    if (pollInterval) {
+      clearInterval(pollInterval);
+      pollInterval = undefined;
+    }
+  }
 
   function startPolling(): void {
     if (config.capabilitiesPollSeconds <= 0) return;
@@ -279,10 +359,16 @@ export async function createProxy(
       if (!remoteClient) return;
       try {
         const caps = remoteClient.getServerCapabilities() ?? {};
+        const client = remoteClient;
 
-        if (caps.tools) {
-          const result = await remoteClient.listTools();
-          const hash = JSON.stringify(result.tools);
+        const [toolsResult, resourcesResult, promptsResult] = await Promise.all([
+          caps.tools ? client.listTools() : undefined,
+          caps.resources ? client.listResources() : undefined,
+          caps.prompts ? client.listPrompts() : undefined,
+        ]);
+
+        if (toolsResult) {
+          const hash = JSON.stringify(toolsResult.tools);
           if (lastToolsHash && hash !== lastToolsHash) {
             logger.info('Remote tools changed, notifying local client');
             await localServer.sendToolListChanged();
@@ -290,9 +376,8 @@ export async function createProxy(
           lastToolsHash = hash;
         }
 
-        if (caps.resources) {
-          const result = await remoteClient.listResources();
-          const hash = JSON.stringify(result.resources);
+        if (resourcesResult) {
+          const hash = JSON.stringify(resourcesResult.resources);
           if (lastResourcesHash && hash !== lastResourcesHash) {
             logger.info('Remote resources changed, notifying local client');
             await localServer.sendResourceListChanged();
@@ -300,9 +385,8 @@ export async function createProxy(
           lastResourcesHash = hash;
         }
 
-        if (caps.prompts) {
-          const result = await remoteClient.listPrompts();
-          const hash = JSON.stringify(result.prompts);
+        if (promptsResult) {
+          const hash = JSON.stringify(promptsResult.prompts);
           if (lastPromptsHash && hash !== lastPromptsHash) {
             logger.info('Remote prompts changed, notifying local client');
             await localServer.sendPromptListChanged();
@@ -310,7 +394,7 @@ export async function createProxy(
           lastPromptsHash = hash;
         }
       } catch (err) {
-        logger.debug('Capabilities poll failed', {
+        logger.warn('Capabilities poll failed', {
           error: err instanceof Error ? err.message : String(err),
         });
       }
@@ -329,9 +413,9 @@ export async function createProxy(
   return {
     async close() {
       logger.info('Shutting down proxy');
-      if (pollInterval) {
-        clearInterval(pollInterval);
-      }
+      closingIntentionally = true;
+      reconnecting = true;
+      stopPolling();
       await localServer.close();
       if (remoteClient) {
         await remoteClient.close();
