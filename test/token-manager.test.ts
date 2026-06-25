@@ -423,11 +423,11 @@ describe('TokenManager', () => {
         expect.objectContaining({ attempt: 2 }),
       );
 
-      // Third attempt at +5s, fails → gives up
+      // Third attempt at +5s, fails → switches to extended backoff
       await vi.advanceTimersByTimeAsync(5_000);
       expect(callCount).toBe(4);
       expect(logger.warn).toHaveBeenCalledWith(
-        'Proactive token refresh failed after max retries (will retry on next 401)',
+        'Proactive token refresh exhausted fast retries, switching to extended backoff',
         expect.objectContaining({ error: 'IdP unavailable', attempts: 3 }),
       );
 
@@ -466,13 +466,53 @@ describe('TokenManager', () => {
       await vi.advanceTimersByTimeAsync(1_250);
       expect(callCount).toBe(3);
 
-      // Another retry at +1250ms
+      // Another retry at +1250ms → switches to extended backoff
       await vi.advanceTimersByTimeAsync(1_250);
       expect(callCount).toBe(4);
       expect(logger.warn).toHaveBeenCalledWith(
-        'Proactive token refresh failed after max retries (will retry on next 401)',
+        'Proactive token refresh exhausted fast retries, switching to extended backoff',
         expect.objectContaining({ attempts: 3 }),
       );
+
+      tm.stop();
+    });
+
+    it('recovers from extended backoff when IdP comes back', async () => {
+      setupAuthenticatedDiscovery();
+      let callCount = 0;
+      mockAuth.mockImplementation(async (provider) => {
+        callCount++;
+        if (callCount === 1) {
+          void provider.saveTokens({ access_token: 'tok', token_type: 'bearer', expires_in: 100 });
+          return 'AUTHORIZED';
+        }
+        if (callCount <= 4) {
+          throw new Error('IdP unavailable');
+        }
+        void provider.saveTokens({ access_token: 'tok-recovered', token_type: 'bearer', expires_in: 3600 });
+        return 'AUTHORIZED';
+      });
+
+      const logger = createMockLogger();
+      const config = createTestConfig({ refreshSkewSeconds: 30 });
+      const tm = createTokenManager(config, logger);
+
+      await tm.discover();
+      await tm.prefetch();
+      expect(callCount).toBe(1);
+
+      // Fast retries exhaust at 70s + 5s + 5s = 80s
+      await vi.advanceTimersByTimeAsync(80_000);
+      expect(callCount).toBe(4);
+      expect(logger.warn).toHaveBeenCalledWith(
+        'Proactive token refresh exhausted fast retries, switching to extended backoff',
+        expect.anything(),
+      );
+
+      // Extended backoff retry succeeds (~30s later)
+      await vi.advanceTimersByTimeAsync(40_000);
+      expect(callCount).toBe(5);
+      expect(logger.info).toHaveBeenCalledWith('Proactive token refresh successful');
 
       tm.stop();
     });

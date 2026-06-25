@@ -26,17 +26,19 @@ test/
   config.test.ts       # Config parsing, validation, defaults
   token-manager.test.ts # Discovery, auth modes, prefetch, proactive refresh
   proxy.test.ts        # E2E with in-memory MCP transports, reconnection
+  proxy-resilience.test.ts # Startup/connection failure recovery, dynamic auth
 ```
 
 ## Architecture Notes
 
 - **stdio reserved for JSON-RPC** -- all proxy logging goes to stderr (`logger.ts`), never stdout. The MCP protocol's own `notifications/message` logging from the remote server passes through to the local client via fallback handlers. The proxy does not inject its own MCP-level log notifications because it mirrors the remote server's declared capabilities (including whether `logging` is supported).
+- **Best-effort discovery** -- Phase 1 discovery connection is best-effort; if the remote MCP server is unreachable at startup, the proxy starts with default capabilities (tools, resources, prompts) and defers connection to when the local client connects. Reconnection with exponential backoff handles eventual recovery.
 - **Two-phase connection** -- discovery connection gets remote server info, then a real connection is established with the local client's actual identity/capabilities after the local handshake completes
 - **Protocol-version agnostic** -- uses SDK fallback handlers for bidirectional pass-through
 - **No hardcoded method tables** -- all 4 message flows use `fallbackRequestHandler`/`fallbackNotificationHandler`
 - **`_meta` sanitization** -- auth-like keys stripped from all client-to-server messages (requests and notifications) before forwarding to remote
 - **Transport fallback** -- Streamable HTTP first, SSE if that fails
-- **Automatic reconnection** -- detects remote `onclose`, reconnects with exponential backoff (1s--60s with jitter), restarts polling; backoff resets after a connection is stable for 30s
+- **Automatic reconnection** -- detects remote `onclose` or Phase 3 connection failure, reconnects with exponential backoff (1s--60s with jitter), restarts polling; backoff resets after a connection is stable for 30s
 - **OAuth re-discovery** -- if IdP is unreachable at startup, stays in `discovery-failed` mode (rejects requests with error) and retries discovery with exponential backoff (5s--60s); transitions to `authenticated` mode when IdP recovers
 - **Local disconnect cleanup** -- detects `localServer.onclose` (stdin closed), awaits remote close with 2s timeout, then exits
 - **Timeouts on all outgoing calls** -- `requestTimeoutMs` applied per-request via SDK `{ timeout }` option for MCP calls, and per-call via `AbortSignal.timeout` for OAuth discovery and token acquisition. Transport constructors do NOT receive a signal (a long-lived signal would go stale and break all requests after it fires).
@@ -45,7 +47,8 @@ test/
 ## Performance Conventions
 
 - Token cached in memory with proactive refresh timer (`refreshSkewSeconds` before expiry)
-- Proactive refresh retries up to 3 times (interval adapts to fit within skew window) before falling back to reactive 401 handling
+- Proactive refresh retries up to 3 fast attempts (interval adapts to fit within skew window), then switches to extended exponential backoff (30s--5min) to keep trying proactively rather than relying solely on reactive 401 handling
+- Dynamic `authProvider` -- `connectRemote()` calls `tokenManager.getAuthProvider()` each time, so reconnections after IdP re-discovery use the correct provider
 - `prefetch()` acquires a real token at startup via `auth()` so the first request never hits a cold path
 - Proactive refresh deduplication (`inflightRefresh`) prevents concurrent refresh attempts
 - Single process, no worker threads needed

@@ -194,11 +194,19 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
 
   const MAX_REFRESH_RETRIES = 3;
   let refreshRetryCount = 0;
+  let extendedRefreshAttempt = 0;
+  const EXTENDED_REFRESH_BASE_MS = 30_000;
+  const EXTENDED_REFRESH_MAX_MS = 300_000;
 
   function getRetryIntervalMs(): number {
     const skewMs = config.refreshSkewSeconds * 1000;
-    // Distribute retries evenly within the skew window
     return Math.max(Math.min(5_000, Math.floor(skewMs / (MAX_REFRESH_RETRIES + 1))), 500);
+  }
+
+  function getExtendedRetryDelay(): number {
+    const exponential = Math.min(EXTENDED_REFRESH_BASE_MS * 2 ** extendedRefreshAttempt, EXTENDED_REFRESH_MAX_MS);
+    const jitter = Math.random() * exponential * 0.2;
+    return Math.round(exponential + jitter);
   }
 
   async function performRefresh(): Promise<void> {
@@ -209,6 +217,7 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
       if (result === 'AUTHORIZED') {
         logger.info('Proactive token refresh successful');
         refreshRetryCount = 0;
+        extendedRefreshAttempt = 0;
       }
     } catch (err) {
       refreshRetryCount++;
@@ -222,11 +231,15 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
         });
         refreshTimer = setTimeout(() => void doProactiveRefresh(), retryMs);
       } else {
-        logger.warn('Proactive token refresh failed after max retries (will retry on next 401)', {
+        const extendedDelayMs = getExtendedRetryDelay();
+        logger.warn('Proactive token refresh exhausted fast retries, switching to extended backoff', {
           error: err instanceof Error ? err.message : String(err),
           attempts: refreshRetryCount,
+          nextRetryMs: extendedDelayMs,
         });
         refreshRetryCount = 0;
+        extendedRefreshAttempt++;
+        refreshTimer = setTimeout(() => void doProactiveRefresh(), extendedDelayMs);
       }
     }
   }
@@ -280,7 +293,7 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
     return undefined;
   }
 
-  function getAuthMode(): AuthMode {d
+  function getAuthMode(): AuthMode {
     return authMode;
   }
 

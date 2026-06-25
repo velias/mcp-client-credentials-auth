@@ -14,6 +14,7 @@ To obtain the required `client_id` and `client_secret`, look for a "Service Acco
 - **Transparent forwarding** - all MCP methods forwarded bidirectionally (tools, resources, prompts, sampling, notifications)
 - **Proactive token refresh** - tokens refreshed before expiry using `refreshSkewSeconds` (default 30s) with automatic retries, no request latency spikes
 - **Transport fallback** - Streamable HTTP with automatic SSE fallback
+- **Resilient startup** - starts even when the remote MCP server or IdP is unavailable, connecting automatically when they become reachable
 - **Automatic reconnection** - detects remote server disconnects and reconnects with exponential backoff, preserving client identity and capabilities
 - **Live change detection** - polls the remote server for capability changes (tools, resources, prompts) and notifies your MCP client automatically
 - **Identity forwarding** - remote server name and capabilities forwarded to your MCP client; your client's real identity and capabilities forwarded to the remote MCP server
@@ -36,7 +37,7 @@ The auth proxy sits between your MCP client and the remote MCP server:
 4. Forwards all MCP requests/responses with `Bearer` authentication
 5. Handles token refresh and 401 retry transparently
 
-If the IdP is temporarily unavailable at startup, the auth proxy will periodically retry OAuth discovery with exponential backoff (5s to 60s) and begin serving requests as soon as discovery succeeds.
+If the IdP is temporarily unavailable at startup, the auth proxy will periodically retry OAuth discovery with exponential backoff (5s to 60s) and begin serving requests as soon as discovery succeeds. If the remote MCP server is unreachable at startup, the auth proxy will still start and accept connections from your MCP client, advertising default capabilities (tools, resources, prompts). It will automatically connect to the remote server when it becomes available.
 
 ## Quick Start
 

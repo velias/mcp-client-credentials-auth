@@ -62,48 +62,49 @@ export async function createProxy(
   tokenManager: TokenManager,
   logger: Logger,
 ): Promise<ProxyHandle> {
-  const authProvider = tokenManager.getAuthProvider();
   const remoteUrl = new URL(config.remoteMcpUrl);
 
-  // --- Phase 1: Discovery connection ---
-  const discoveryClient = new Client(
-    { name: PROXY_NAME, version: PKG_VERSION },
-    { capabilities: {} },
-  );
+  // --- Phase 1: Discovery connection (best-effort) ---
+  let discoveredCapabilities: ServerCapabilities = {};
+  let remoteServerInfo: Implementation | undefined;
 
   logger.info('Connecting to remote MCP server for discovery', { url: config.remoteMcpUrl });
   try {
-    const httpTransport = new StreamableHTTPClientTransport(remoteUrl, {
-      authProvider,
-    });
-    await discoveryClient.connect(httpTransport);
-    logger.info('Discovery: connected via Streamable HTTP');
-  } catch (httpErr) {
-    logger.info('Streamable HTTP connection failed, trying SSE fallback', {
-      error: httpErr instanceof Error ? httpErr.message : String(httpErr),
-    });
+    const authProvider = tokenManager.getAuthProvider();
+    const discoveryClient = new Client(
+      { name: PROXY_NAME, version: PKG_VERSION },
+      { capabilities: {} },
+    );
+
     try {
+      const httpTransport = new StreamableHTTPClientTransport(remoteUrl, {
+        authProvider,
+      });
+      await discoveryClient.connect(httpTransport);
+      logger.info('Discovery: connected via Streamable HTTP');
+    } catch (httpErr) {
+      logger.info('Streamable HTTP connection failed, trying SSE fallback', {
+        error: httpErr instanceof Error ? httpErr.message : String(httpErr),
+      });
       const sseTransport = new SSEClientTransport(remoteUrl, {
         authProvider,
       });
       await discoveryClient.connect(sseTransport);
       logger.info('Discovery: connected to remote MCP server via SSE');
-    } catch (sseErr) {
-      logger.error('Failed to connect to remote MCP server', {
-        httpError: httpErr instanceof Error ? httpErr.message : String(httpErr),
-        sseError: sseErr instanceof Error ? sseErr.message : String(sseErr),
-      });
-      throw new Error(
-        `Cannot connect to remote MCP server at ${config.remoteMcpUrl}: ${sseErr instanceof Error ? sseErr.message : String(sseErr)}`,
-        { cause: sseErr },
-      );
     }
-  }
 
-  const discoveredCapabilities: ServerCapabilities = discoveryClient.getServerCapabilities() ?? {};
-  const remoteServerInfo = discoveryClient.getServerVersion();
-  await discoveryClient.close();
-  logger.debug('Discovery connection closed');
+    discoveredCapabilities = discoveryClient.getServerCapabilities() ?? {};
+    remoteServerInfo = discoveryClient.getServerVersion();
+    await discoveryClient.close();
+    logger.debug('Discovery connection closed');
+  } catch (err) {
+    logger.warn(
+      'Remote MCP server unreachable during discovery; starting with default capabilities. ' +
+      'Will attempt connection when local client connects.',
+      { error: err instanceof Error ? err.message : String(err) },
+    );
+    discoveredCapabilities = { tools: {}, resources: {}, prompts: {} };
+  }
 
   // --- Phase 2: Create local server with discovered info ---
   const localServer = new Server(
@@ -120,6 +121,7 @@ export async function createProxy(
     identity: Implementation,
     capabilities: ClientCapabilities,
   ): Promise<Client> {
+    const authProvider = tokenManager.getAuthProvider();
     logger.debug('Connecting to remote MCP server', { clientName: identity.name });
     const client = new Client(identity, { capabilities });
 
@@ -303,10 +305,11 @@ export async function createProxy(
         startPolling();
         readyResolve();
       } catch (err) {
-        logger.error('Failed to establish real remote connection', {
+        logger.warn('Failed to establish real remote connection, scheduling reconnection', {
           error: err instanceof Error ? err.message : String(err),
         });
         readyResolve();
+        void reconnect();
       }
     })();
   };
@@ -324,7 +327,7 @@ export async function createProxy(
     }
 
     if (!remoteClient) {
-      throw new Error('Remote MCP server connection not available');
+      throw new Error('Remote MCP server temporarily unavailable (reconnecting)');
     }
 
     const sanitizedParams = sanitizeMeta(request.params);
