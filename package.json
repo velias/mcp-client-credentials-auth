@@ -1,7 +1,7 @@
 {
   "name": "mcp-client-credentials-auth",
   "version": "0.1.0",
-  "description": "Local MCP server that authenticates to remote OAuth-protected MCP servers following MCP Auth Specification using client_credentials grant",
+  "description": "Local MCP server that authenticates to remote OAuth-protected MCP servers following MCP Auth Specification using client_credentials grant usefull for autonomous agents, background services, CI/CD pipelines, server-to-server integrations, and daemon processes that need MCP access without the user in the loop",
   "main": "dist/index.js",
   "bin": {
     "mcp-client-credentials-auth": "dist/index.js"

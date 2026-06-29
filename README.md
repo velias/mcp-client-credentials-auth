@@ -80,7 +80,7 @@ All configuration via `MCP_CC_PROXY_*` environment variables:
 
 ### Protecting Secrets with Vaults
 
-The Quick Start example puts secrets directly in the MCP client config. These end up as environment variables, which are visible in `/proc/<pid>/environ` to the same OS user (matching the security boundary of the MCP client itself). For better security, fetch them at launch time from a vault or keychain so they never sit on disk in plaintext.
+The Quick Start example puts secrets directly in the MCP client config. These are typically stored on disc as plain text. For better security, fetch them at launch time from a vault or keychain.
 
 #### 1Password CLI
 
@@ -136,20 +136,20 @@ Bitwarden must be unlocked (`bw unlock`) before the MCP client starts the proxy.
 
 #### macOS Keychain
 
-Store the credentials in the built-in macOS Keychain. The `-s` flag is the service name (a label you choose to identify this entry), `-a` is the account name, and `-w` is the secret value:
+Store the client secret in the built-in macOS Keychain. The `-s` flag is the service name (a label you choose to identify this entry), `-a` is the account name, and `-w` is the secret value:
 
 ```bash
-security add-generic-password -s "My MCP Credentials" -a "client_id" -w "my-client-id"
 security add-generic-password -s "My MCP Credentials" -a "client_secret" -w "my-client-secret"
 ```
 
-Then use a wrapper script to read both at launch:
+Then use a wrapper script to read it at launch:
 
 ```bash
 #!/usr/bin/env bash
 export MCP_CC_PROXY_REMOTE_MCP_URL="https://mcp.example.com/mcp"
+# The OAuth client ID assigned by your identity provider
+export MCP_CC_PROXY_CLIENT_ID="my-oauth-client-id"
 # -s and -a must match the values used in add-generic-password above
-export MCP_CC_PROXY_CLIENT_ID="$(security find-generic-password -s 'My MCP Credentials' -a 'client_id' -w)"
 export MCP_CC_PROXY_CLIENT_SECRET="$(security find-generic-password -s 'My MCP Credentials' -a 'client_secret' -w)"
 exec npx -y mcp-client-credentials-auth
 ```
@@ -157,23 +157,10 @@ exec npx -y mcp-client-credentials-auth
 No extra software required; the Keychain is built into macOS and protected by your login password or Touch ID.
 
 ### Runtime Credential Safeguards
-- Access tokens stored only in memory, never logged
+- Access token is stored only in memory, never logged
 - Client secrets loaded at startup, never forwarded or logged
 - Authorization header always set by the auth proxy, never influenced by MCP client content
 - Auth-like metadata keys (`authorization`, `token`, `bearer`, `access_token`, `client_secret`) stripped from `_meta` in all client-to-server messages (requests and notifications) before forwarding
-- All log output redacts token/secret values
-
-### OAuth Scopes
-- When `MCP_CC_PROXY_SCOPES` is set, that value is sent verbatim in the token request, discovered scopes are ignored
-- When not set, the auth proxy requests all scopes from `scopes_supported` in the MCP Server's resource metadata
-- Scope grants are bounded by IdP client configuration (IdP is the ceiling, regardless of what the proxy requests)
-- Configure your IdP client with minimal necessary scopes (least privilege)
-
-### Transport Security
-- Always use `https://` for production remote MCP server URLs to protect the access token on the wire
-- TLS certificates validated by default (Node.js `fetch`)
-- `http://` is allowed for local development (`localhost`, `127.0.0.1`, `[::1]`) but logs a security warning for non-loopback hosts
-- Warning logged if `NODE_TLS_REJECT_UNAUTHORIZED=0` is detected
 
 ## Troubleshooting
 
