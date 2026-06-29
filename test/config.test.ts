@@ -105,4 +105,24 @@ describe('Config', () => {
     expect(() => loadConfig()).toThrow('Invalid configuration');
   });
 
+  it('parses MCP_CC_PROXY_SCOPES into config.scopes', () => {
+    setRequiredEnv();
+    process.env.MCP_CC_PROXY_SCOPES = 'https://my-api.example.com/.default';
+    const config = loadConfig();
+    expect(config.scopes).toBe('https://my-api.example.com/.default');
+  });
+
+  it('leaves scopes undefined when MCP_CC_PROXY_SCOPES is not set', () => {
+    setRequiredEnv();
+    const config = loadConfig();
+    expect(config.scopes).toBeUndefined();
+  });
+
+  it('treats empty MCP_CC_PROXY_SCOPES as undefined', () => {
+    setRequiredEnv();
+    process.env.MCP_CC_PROXY_SCOPES = '';
+    const config = loadConfig();
+    expect(config.scopes).toBeUndefined();
+  });
+
 });

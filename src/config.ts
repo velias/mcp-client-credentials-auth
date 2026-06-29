@@ -16,6 +16,7 @@ export const ConfigSchema = z.object({
   refreshSkewSeconds: z.number().int().positive().default(30),
   requestTimeoutMs: z.number().int().positive().default(30000),
   capabilitiesPollSeconds: z.number().int().min(0).default(60),
+  scopes: z.string().optional(),
   debug: z.boolean().default(false),
 });
 
@@ -44,6 +45,7 @@ export function loadConfig(): Config {
     capabilitiesPollSeconds: parseNumber(
       process.env.MCP_CC_PROXY_CAPABILITIES_POLL_SECONDS,
     ),
+    scopes: process.env.MCP_CC_PROXY_SCOPES || undefined,
     debug: parseBool(process.env.MCP_CC_PROXY_DEBUG),
   };
 

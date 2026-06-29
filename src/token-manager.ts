@@ -143,7 +143,12 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
       return;
     }
 
-    if (resourceMetadata?.scopes_supported?.length) {
+    if (config.scopes) {
+      currentScopes = config.scopes;
+      logger.info('Using scopes from MCP_CC_PROXY_SCOPES (overriding discovery)', {
+        scopes: currentScopes,
+      });
+    } else if (resourceMetadata?.scopes_supported?.length) {
       currentScopes = resourceMetadata.scopes_supported.join(' ');
     }
 

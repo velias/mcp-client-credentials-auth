@@ -23,10 +23,12 @@ src/
   token-manager.ts     # OAuth discovery, client_credentials, cache, refresh
   proxy.ts             # Wire local Server <-> remote Client
 test/
-  config.test.ts       # Config parsing, validation, defaults
-  token-manager.test.ts # Discovery, auth modes, prefetch, proactive refresh
-  proxy.test.ts        # E2E with in-memory MCP transports, reconnection
+  config.test.ts           # Config parsing, validation, defaults, scope override
+  token-manager.test.ts    # Discovery, auth modes, scope resolution, prefetch, proactive refresh
+  proxy.test.ts            # E2E with in-memory MCP transports, reconnection
+  proxy-advanced.test.ts   # Auth mode error handling (unsupported-grant, discovery-failed)
   proxy-resilience.test.ts # Startup/connection failure recovery, dynamic auth
+  logger.test.ts           # Log output formatting, levels, secret redaction
 ```
 
 ## Architecture Notes
@@ -43,6 +45,7 @@ test/
 - **Local disconnect cleanup** -- detects `localServer.onclose` (stdin closed), awaits remote close with 2s timeout, then exits
 - **Timeouts on all outgoing calls** -- `requestTimeoutMs` applied per-request via SDK `{ timeout }` option for MCP calls, and per-call via `AbortSignal.timeout` for OAuth discovery and token acquisition. Transport constructors do NOT receive a signal (a long-lived signal would go stale and break all requests after it fires).
 - **Proactive refresh via `saveTokens` hook** -- monkey-patches `ClientCredentialsProvider.saveTokens` to schedule a timer; this is a deliberate coupling to SDK internals (see upgrade checklist)
+- **Scope override** -- `MCP_CC_PROXY_SCOPES` env var takes priority over discovered `scopes_supported` from resource metadata. This decouples the token request scopes from the server's discovery metadata, which is necessary when the IdP requires a different scope format (e.g., Entra ID's `{resource}/.default`).
 
 ## Performance Conventions
 

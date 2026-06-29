@@ -212,6 +212,84 @@ describe('TokenManager', () => {
     });
   });
 
+  describe('scope resolution', () => {
+    it('uses config.scopes over discovered scopes_supported', async () => {
+      setupAuthenticatedDiscovery();
+
+      const logger = createMockLogger();
+      const config = createTestConfig({ scopes: 'https://my-api.example.com/.default' });
+      const tm = createTokenManager(config, logger);
+
+      await tm.discover();
+
+      const provider = tm.getAuthProvider() as { clientMetadata: { scope?: string } };
+      expect(provider.clientMetadata.scope).toBe('https://my-api.example.com/.default');
+      expect(logger.info).toHaveBeenCalledWith(
+        'Using scopes from MCP_CC_PROXY_SCOPES (overriding discovery)',
+        expect.objectContaining({ scopes: 'https://my-api.example.com/.default' }),
+      );
+    });
+
+    it('uses config.scopes when scopes_supported is empty', async () => {
+      mockDiscoverResource.mockResolvedValue({
+        resource: 'https://mcp.example.com/mcp',
+        authorization_servers: ['https://auth.example.com'],
+      });
+      mockDiscoverAS.mockResolvedValue({
+        issuer: 'https://auth.example.com',
+        token_endpoint: 'https://auth.example.com/token',
+        grant_types_supported: ['client_credentials'],
+      });
+
+      const logger = createMockLogger();
+      const config = createTestConfig({ scopes: 'custom:scope' });
+      const tm = createTokenManager(config, logger);
+
+      await tm.discover();
+
+      const provider = tm.getAuthProvider() as { clientMetadata: { scope?: string } };
+      expect(provider.clientMetadata.scope).toBe('custom:scope');
+    });
+
+    it('falls back to discovered scopes when config.scopes is not set', async () => {
+      setupAuthenticatedDiscovery();
+
+      const logger = createMockLogger();
+      const config = createTestConfig();
+      const tm = createTokenManager(config, logger);
+
+      await tm.discover();
+
+      const provider = tm.getAuthProvider() as { clientMetadata: { scope?: string } };
+      expect(provider.clientMetadata.scope).toBe('read write');
+      expect(logger.info).not.toHaveBeenCalledWith(
+        'Using scopes from MCP_CC_PROXY_SCOPES (overriding discovery)',
+        expect.anything(),
+      );
+    });
+
+    it('omits scope when neither config.scopes nor scopes_supported is set', async () => {
+      mockDiscoverResource.mockResolvedValue({
+        resource: 'https://mcp.example.com/mcp',
+        authorization_servers: ['https://auth.example.com'],
+      });
+      mockDiscoverAS.mockResolvedValue({
+        issuer: 'https://auth.example.com',
+        token_endpoint: 'https://auth.example.com/token',
+        grant_types_supported: ['client_credentials'],
+      });
+
+      const logger = createMockLogger();
+      const config = createTestConfig();
+      const tm = createTokenManager(config, logger);
+
+      await tm.discover();
+
+      const provider = tm.getAuthProvider() as { clientMetadata: { scope?: string } };
+      expect(provider.clientMetadata.scope).toBeUndefined();
+    });
+  });
+
   describe('getAuthProvider', () => {
     it('returns undefined when not in authenticated mode', async () => {
       mockDiscoverResource.mockRejectedValue(new Error('Not found'));
