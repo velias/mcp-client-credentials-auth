@@ -132,7 +132,7 @@ describe('Proxy (createProxy integration)', () => {
     await endClient.connect(localTransportPair[0]);
 
     // Wait for Phase 3 (oninitialized → reconnect) to complete
-    await new Promise((r) => setTimeout(r, 200));
+    await new Promise((r) => setTimeout(r, 50));
   });
 
   afterEach(async () => {
@@ -259,7 +259,7 @@ describe('Proxy (createProxy integration)', () => {
         params: { data: 'hello' },
       } as Parameters<typeof upstream.notification>[0]);
 
-      await new Promise((r) => setTimeout(r, 100));
+      await new Promise((r) => setTimeout(r, 50));
       expect(received).toHaveBeenCalledWith(
         expect.objectContaining({ method: 'notifications/custom/test' }),
       );
@@ -308,7 +308,7 @@ describe('Proxy (createProxy integration)', () => {
         params: { data: 'world' },
       } as Parameters<typeof endClient.notification>[0]);
 
-      await new Promise((r) => setTimeout(r, 100));
+      await new Promise((r) => setTimeout(r, 50));
       expect(received).toHaveBeenCalledWith(
         expect.objectContaining({ method: 'notifications/custom/fromclient' }),
       );
@@ -335,7 +335,7 @@ describe('Proxy (createProxy integration)', () => {
         },
       } as Parameters<typeof endClient.notification>[0]);
 
-      await new Promise((r) => setTimeout(r, 100));
+      await new Promise((r) => setTimeout(r, 50));
       expect(receivedParams?._meta).not.toHaveProperty('authorization');
       expect(receivedParams?._meta).not.toHaveProperty('token');
       expect(receivedParams?._meta).not.toHaveProperty('client_secret');
@@ -436,7 +436,7 @@ describe('Proxy (createProxy integration)', () => {
       await upstream.close();
 
       // Wait for reconnection to happen
-      await new Promise((r) => setTimeout(r, 300));
+      await new Promise((r) => setTimeout(r, 100));
 
       // Should have created a new connection
       expect(connectCount).toBeGreaterThan(initialConnectCount);
@@ -448,7 +448,7 @@ describe('Proxy (createProxy integration)', () => {
       await oldUpstream.close();
 
       // Wait for reconnection
-      await new Promise((r) => setTimeout(r, 300));
+      await new Promise((r) => setTimeout(r, 100));
 
       // The new upstream should be serving requests
       const newUpstream = getUpstreamServer();
@@ -472,7 +472,7 @@ describe('Proxy (createProxy integration)', () => {
       const oldUpstream = getUpstreamServer();
       await oldUpstream.close();
 
-      await new Promise((r) => setTimeout(r, 300));
+      await new Promise((r) => setTimeout(r, 100));
 
       const newUpstream = getUpstreamServer();
       const clientInfo = newUpstream.getClientVersion();
@@ -484,7 +484,7 @@ describe('Proxy (createProxy integration)', () => {
       const oldUpstream = getUpstreamServer();
       await oldUpstream.close();
 
-      await new Promise((r) => setTimeout(r, 300));
+      await new Promise((r) => setTimeout(r, 100));
 
       const newUpstream = getUpstreamServer();
       const clientCaps = newUpstream.getClientCapabilities();
@@ -496,7 +496,7 @@ describe('Proxy (createProxy integration)', () => {
       const countBefore = connectCount;
       await proxyHandle.close();
 
-      await new Promise((r) => setTimeout(r, 200));
+      await new Promise((r) => setTimeout(r, 50));
 
       // close() sets reconnecting=true, so onclose should NOT trigger a reconnect
       // Only the close itself should have run, no new connections

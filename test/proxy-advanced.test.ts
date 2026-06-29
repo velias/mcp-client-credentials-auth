@@ -114,7 +114,7 @@ async function setupProxy(opts?: { config?: Partial<Config>; authMode?: AuthMode
   await endClient.connect(localTransportPair[0]);
 
   // Wait for Phase 3 to complete
-  await new Promise((r) => setTimeout(r, 200));
+  await new Promise((r) => setTimeout(r, 50));
 
   return { proxyHandle, endClient, logger, tokenManager };
 }
@@ -176,7 +176,7 @@ describe('Proxy capabilities polling', () => {
   
     upstreamServers.length = 0;
 
-    const config = createMockConfig({ capabilitiesPollSeconds: 1 });
+    const config = createMockConfig({ capabilitiesPollSeconds: 0.1 });
     const logger = createMockLogger();
     const tokenManager = createMockTokenManager();
 
@@ -209,7 +209,7 @@ describe('Proxy capabilities polling', () => {
     await endClient.connect(localTransportPair[0]);
 
     // Wait for Phase 3 + first poll
-    await new Promise((r) => setTimeout(r, 800));
+    await new Promise((r) => setTimeout(r, 200));
 
     // Update handler on the real upstream (last one)
     const upstream = upstreamServers[upstreamServers.length - 1];
@@ -226,10 +226,10 @@ describe('Proxy capabilities polling', () => {
     };
 
     // Wait for second poll to detect change
-    await new Promise((r) => setTimeout(r, 1500));
+    await new Promise((r) => setTimeout(r, 200));
 
     expect(notifications).toContain('notifications/tools/list_changed');
-  }, 10000);
+  });
 
   it('does not poll when capabilitiesPollSeconds is 0', async () => {
     const result = await setupProxy({ config: { capabilitiesPollSeconds: 0 } });
@@ -246,7 +246,7 @@ describe('Proxy capabilities polling', () => {
       return {};
     };
 
-    await new Promise((r) => setTimeout(r, 500));
+    await new Promise((r) => setTimeout(r, 200));
     expect(listToolsCalled).not.toHaveBeenCalled();
   });
 });
@@ -266,7 +266,7 @@ describe('Proxy resources and prompts polling', () => {
   
     upstreamServers.length = 0;
 
-    const config = createMockConfig({ capabilitiesPollSeconds: 1 });
+    const config = createMockConfig({ capabilitiesPollSeconds: 0.1 });
     const logger = createMockLogger();
     const tokenManager = createMockTokenManager();
 
@@ -294,7 +294,7 @@ describe('Proxy resources and prompts polling', () => {
     };
     await endClient.connect(localTransportPair[0]);
 
-    await new Promise((r) => setTimeout(r, 800));
+    await new Promise((r) => setTimeout(r, 200));
 
     // Update upstream handler after first poll
     const upstream = upstreamServers[upstreamServers.length - 1];
@@ -305,15 +305,15 @@ describe('Proxy resources and prompts polling', () => {
       return {};
     };
 
-    await new Promise((r) => setTimeout(r, 1500));
+    await new Promise((r) => setTimeout(r, 200));
     expect(notifications).toContain('notifications/resources/list_changed');
-  }, 10000);
+  });
 
   it('polls and detects prompt changes', async () => {
   
     upstreamServers.length = 0;
 
-    const config = createMockConfig({ capabilitiesPollSeconds: 1 });
+    const config = createMockConfig({ capabilitiesPollSeconds: 0.1 });
     const logger = createMockLogger();
     const tokenManager = createMockTokenManager();
 
@@ -339,7 +339,7 @@ describe('Proxy resources and prompts polling', () => {
     };
     await endClient.connect(localTransportPair[0]);
 
-    await new Promise((r) => setTimeout(r, 800));
+    await new Promise((r) => setTimeout(r, 200));
 
     const upstream = upstreamServers[upstreamServers.length - 1];
     upstream.fallbackRequestHandler = async (request) => {
@@ -349,9 +349,9 @@ describe('Proxy resources and prompts polling', () => {
       return {};
     };
 
-    await new Promise((r) => setTimeout(r, 1500));
+    await new Promise((r) => setTimeout(r, 200));
     expect(notifications).toContain('notifications/prompts/list_changed');
-  }, 10000);
+  });
 });
 
 describe('Proxy buildClientIdentity fallback', () => {
@@ -383,7 +383,7 @@ describe('Proxy buildClientIdentity fallback', () => {
     );
     await endClient.connect(localTransportPair[0]);
 
-    await new Promise((r) => setTimeout(r, 200));
+    await new Promise((r) => setTimeout(r, 50));
 
     const upstream = upstreamServers[upstreamServers.length - 1];
     const clientInfo = upstream.getClientVersion();

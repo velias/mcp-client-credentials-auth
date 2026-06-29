@@ -145,7 +145,7 @@ describe('Proxy resilience', () => {
       await endClient.connect(localTransportPair[0]);
 
       // Wait for Phase 3 connection (calls 3-4 succeed)
-      await new Promise((r) => setTimeout(r, 300));
+      await new Promise((r) => setTimeout(r, 100));
 
       const caps = endClient.getServerCapabilities();
       expect(caps?.tools).toBeDefined();
@@ -195,7 +195,7 @@ describe('Proxy resilience', () => {
         { capabilities: { sampling: {} } },
       );
       await endClient.connect(localTransportPair[0]);
-      await new Promise((r) => setTimeout(r, 300));
+      await new Promise((r) => setTimeout(r, 100));
 
       const upstream = upstreamServers[upstreamServers.length - 1];
       upstream.fallbackRequestHandler = async (request) => {
@@ -234,8 +234,8 @@ describe('Proxy resilience', () => {
       );
       await endClient.connect(localTransportPair[0]);
 
-      // Wait for Phase 3 failure + reconnection
-      await new Promise((r) => setTimeout(r, 2000));
+      // Wait for Phase 3 failure + reconnection (attempt 0 has no backoff delay)
+      await new Promise((r) => setTimeout(r, 100));
 
       expect(logger.warn).toHaveBeenCalledWith(
         expect.stringContaining('Failed to establish real remote connection, scheduling reconnection'),
@@ -277,7 +277,7 @@ describe('Proxy resilience', () => {
       );
       await endClient.connect(localTransportPair[0]);
 
-      await new Promise((r) => setTimeout(r, 300));
+      await new Promise((r) => setTimeout(r, 100));
 
       await expect(
         endClient.request(
@@ -305,7 +305,7 @@ describe('Proxy resilience', () => {
         { capabilities: {} },
       );
       await endClient.connect(localTransportPair[0]);
-      await new Promise((r) => setTimeout(r, 200));
+      await new Promise((r) => setTimeout(r, 50));
 
       // Phase 1 discovery + Phase 3 real connection = at least 2 calls
       expect(tokenManager.getAuthProvider).toHaveBeenCalledTimes(2);
