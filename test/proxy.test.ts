@@ -174,6 +174,12 @@ describe('Proxy (createProxy integration)', () => {
       expect(clientInfo?.name).toBe('mcp-client-credentials-auth');
       expect(clientInfo?.version).toBe('0.1.0');
     });
+
+    it('discovery connection announces client credentials extension', () => {
+      const discoveryUpstream = upstreamServers[0];
+      const clientCaps = discoveryUpstream.getClientCapabilities();
+      expect(clientCaps?.extensions?.['io.modelcontextprotocol/oauth-client-credentials']).toEqual({});
+    });
   });
 
   describe('Capabilities forwarding', () => {
@@ -183,6 +189,7 @@ describe('Proxy (createProxy integration)', () => {
       expect(clientCaps?.sampling).toBeDefined();
       expect(clientCaps?.roots).toBeDefined();
       expect(clientCaps?.roots?.listChanged).toBe(true);
+      expect(clientCaps?.extensions?.['io.modelcontextprotocol/oauth-client-credentials']).toEqual({});
     });
 
     it('mirrors server capabilities to end client', () => {
@@ -490,6 +497,7 @@ describe('Proxy (createProxy integration)', () => {
       const clientCaps = newUpstream.getClientCapabilities();
       expect(clientCaps?.sampling).toBeDefined();
       expect(clientCaps?.roots).toBeDefined();
+      expect(clientCaps?.extensions?.['io.modelcontextprotocol/oauth-client-credentials']).toEqual({});
     });
 
     it('does not trigger reconnection during intentional close', async () => {

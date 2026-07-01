@@ -16,6 +16,7 @@ const pkg = JSON.parse(
 ) as { version: string };
 export const PKG_VERSION = pkg.version;
 const PROXY_NAME = 'mcp-client-credentials-auth';
+const CLIENT_CREDENTIALS_EXTENSION = 'io.modelcontextprotocol/oauth-client-credentials';
 
 const permissiveSchema = z.object({}).passthrough();
 
@@ -41,6 +42,16 @@ function sanitizeMeta(
     }
   }
   return { ...params, _meta: sanitized };
+}
+
+function withClientCredentialsExtension(capabilities: ClientCapabilities): ClientCapabilities {
+  return {
+    ...capabilities,
+    extensions: {
+      ...capabilities.extensions,
+      [CLIENT_CREDENTIALS_EXTENSION]: {},
+    },
+  };
 }
 
 function buildClientIdentity(localClientInfo: Implementation | undefined): Implementation {
@@ -73,7 +84,7 @@ export async function createProxy(
     const authProvider = tokenManager.getAuthProvider();
     const discoveryClient = new Client(
       { name: PROXY_NAME, version: PKG_VERSION },
-      { capabilities: {} },
+      { capabilities: withClientCredentialsExtension({}) },
     );
 
     try {
@@ -123,7 +134,9 @@ export async function createProxy(
   ): Promise<Client> {
     const authProvider = tokenManager.getAuthProvider();
     logger.debug('Connecting to remote MCP server', { clientName: identity.name });
-    const client = new Client(identity, { capabilities });
+    const client = new Client(identity, {
+      capabilities: withClientCredentialsExtension(capabilities),
+    });
 
     try {
       const httpTransport = new StreamableHTTPClientTransport(remoteUrl, {

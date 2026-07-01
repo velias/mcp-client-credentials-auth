@@ -1,5 +1,9 @@
 # mcp-client-credentials-auth
 
+[![CI](https://github.com/velias/mcp-client-credentials-auth/actions/workflows/ci.yml/badge.svg)](https://github.com/velias/mcp-client-credentials-auth/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/velias/f550f0ffe68a574a690032088359fef3/raw/mcp-client-credentials-auth-coverage.json)](https://github.com/velias/mcp-client-credentials-auth/actions/workflows/ci.yml)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/velias/mcp-client-credentials-auth/badge)](https://securityscorecards.dev/viewer/?uri=github.com/velias/mcp-client-credentials-auth)
+
 A local stdio MCP server that authenticates to remote OAuth-protected MCP servers using the **client_credentials** grant, as defined in the [MCP OAuth Client Credentials extension](https://modelcontextprotocol.io/extensions/auth/oauth-client-credentials).
 
 Drop it into any MCP client configuration and it transparently handles [MCP Authorization](https://modelcontextprotocol.io/specification/2025-11-05/basic/authorization)-based OAuth discovery of the remote MCP Server and its announced Authorization server (IdP), access token acquisition, and MCP request forwarding. Throughout this document, we refer to it as **the auth proxy**.
@@ -160,7 +164,7 @@ No extra software required; the Keychain is built into macOS and protected by yo
 - Access token is stored only in memory, never logged
 - Client secrets loaded at startup, never forwarded or logged
 - Authorization header always set by the auth proxy, never influenced by MCP client content
-- Auth-like metadata keys (`authorization`, `token`, `bearer`, `access_token`, `client_secret`) stripped from `_meta` in all client-to-server messages (requests and notifications) before forwarding
+- Auth-like metadata keys (`authorization`, `token`, `bearer`, `access_token`, `client_secret`) stripped from `_meta` in all client-to-server messages (requests and notifications) before forwarding to prevent any influence by MCP Client
 
 ## Troubleshooting
 
@@ -249,6 +253,8 @@ The MCP protocol exchanges identity (`name`, `version`) and capabilities during 
 No configuration is needed; the real client name is introspected from the MCP handshake.
 
 **Client capabilities → remote server:** The auth proxy forwards the local client's declared capabilities (`sampling`, `roots`, `elicitation`, etc.) to the remote server. This enables server-to-client features like sampling requests and root listing to work through the auth proxy.
+
+**Extension announcement:** The auth proxy automatically declares the [`io.modelcontextprotocol/oauth-client-credentials`](https://modelcontextprotocol.io/extensions/auth/oauth-client-credentials) extension in its client capabilities when connecting to the remote server. This signals to the remote server that the connecting client authenticates via the client credentials flow, allowing the server to adjust behavior accordingly (e.g., skip interactive auth prompts, apply machine-to-machine policies). The extension is declared on both the discovery connection and the real connection.
 
 ## Known Issues
 

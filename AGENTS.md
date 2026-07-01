@@ -9,7 +9,7 @@
 - **Runtime:** Node.js >= 18
 - **Language:** TypeScript 5.x (strict mode, CommonJS output)
 - **MCP SDK:** `@modelcontextprotocol/sdk` (both client and server modules)
-- **Validation:** Zod 4
+- **Validation:** Zod 4 (`zod/v4` for config validation, `zod/v3` for SDK interop; see SDK upgrade checklist)
 - **Test framework:** Vitest 4
 - **Linter:** ESLint with typescript-eslint (flat config)
 
@@ -116,8 +116,13 @@ When bumping `@modelcontextprotocol/sdk`, check the following areas where the pr
 
 - **`fallbackRequestHandler` / `fallbackNotificationHandler`** -- our entire pass-through design depends on these catch-all handlers. If the SDK removes them or changes precedence (e.g., registered handlers always win), proxying breaks.
 - **`Server.request()` / `Server.notification()`** -- we use these to forward messages from remote to local. Check that they still accept arbitrary method strings.
-- **`getServerCapabilities()` / `getClientCapabilities()`** -- used for identity/capability forwarding. These should remain available after `connect()`.
+- **`getServerCapabilities()` / `getClientCapabilities()`** -- used for capability forwarding. These should remain available after `connect()`.
+- **`getServerVersion()` / `getClientVersion()`** -- used for identity forwarding (remote server name shown to local client, local client name forwarded to remote). If renamed or removed, identity forwarding breaks.
 - **`sendToolListChanged` / `sendResourceListChanged` / `sendPromptListChanged`** -- we call these to notify the local client of changes. If the SDK renames or gates them behind capability checks, polling notifications break.
+
+### Zod compatibility (`proxy.ts`)
+
+- **`zod/v3` import** -- `proxy.ts` imports from `zod/v3` because the SDK's `Client.request()` / `Server.request()` expect a zod v3 `ZodType` for the response schema. `config.ts` uses `zod/v4` for config validation. If the SDK migrates to zod v4 types internally, the `zod/v3` import in `proxy.ts` can be switched to `zod/v4`.
 
 ### Known SDK issues to re-check
 
