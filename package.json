@@ -20,7 +20,7 @@
     "prepublishOnly": "npm run lint && npm test && npm run build"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "keywords": [
     "mcp",
@@ -58,7 +58,7 @@
     "@vitest/coverage-v8": "^4.1.9",
     "eslint": "^10.2.1",
     "tsx": "^4.22.4",
-    "typescript": "^5.8.3",
+    "typescript": "^6.0.3",
     "typescript-eslint": "^8.59.0",
     "vitest": "^4.1.9"
   }

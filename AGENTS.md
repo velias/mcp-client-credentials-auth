@@ -6,7 +6,7 @@
 
 ## Tech Stack
 
-- **Runtime:** Node.js >= 18
+- **Runtime:** Node.js >= 20
 - **Language:** TypeScript 5.x (strict mode, CommonJS output)
 - **MCP SDK:** `@modelcontextprotocol/sdk` (both client and server modules)
 - **Validation:** Zod 4 (`zod/v4` for config validation, `zod/v3` for SDK interop; see SDK upgrade checklist)
