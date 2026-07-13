@@ -23,12 +23,7 @@ add context, highlight important changes, or remove noise.
 - Push access to `main`
 - [GitHub CLI](https://cli.github.com/) (`gh`) installed and authenticated
   (`gh auth login`)
-- `NPM_TOKEN` configured as a **Repository secret** in GitHub Actions:
-  Settings > Secrets and variables > Actions > Repository secrets
-  (https://github.com/velias/mcp-client-credentials-auth/settings/secrets/actions)
-
-  The value is an npm Granular Access Token -- see "Initial npm token setup"
-  and "npm token maintenance" below.
+- **Trusted Publishing** configured on npmjs.com (see below)
 
 ## Steps
 
@@ -39,7 +34,7 @@ add context, highlight important changes, or remove noise.
 4. Push: `git push origin main --follow-tags`
 5. The `release.yml` workflow will automatically:
    - Run lint, test, build
-   - Publish to npm with provenance
+   - Publish to npm via OIDC Trusted Publishing (no token needed)
    - Create a GitHub Release with auto-generated notes
 6. (Optional) Edit the GitHub Release notes in the UI to curate
 
@@ -49,56 +44,76 @@ add context, highlight important changes, or remove noise.
 - `minor` -- new features, non-breaking behavior changes
 - `major` -- breaking changes (config format, removed features, API changes)
 
-## Initial npm token setup
+## Authentication: Trusted Publishing (OIDC)
+
+The release workflow uses **npm Trusted Publishing** with OpenID Connect (OIDC)
+instead of long-lived npm tokens. GitHub Actions generates a short-lived OIDC
+credential for each workflow run; npm verifies the workflow identity and allows
+the publish. No secrets to store or rotate.
+
+### Setup (one-time, after first publish)
+
+Trusted Publishing can only be configured on a package that already exists on
+npm. After the first publish (see "First publish" below), configure it:
+
+1. Go to **npmjs.com > package settings** for
+   [mcp-client-credentials-auth](https://www.npmjs.com/package/mcp-client-credentials-auth/access)
+2. Under **Publishing access**, click **Add trusted publisher**
+3. Configure:
+   - **Provider**: GitHub Actions
+   - **Organization or user**: `velias`
+   - **Repository**: `mcp-client-credentials-auth`
+   - **Workflow filename**: `release.yml`
+   - **Environment**: leave empty
+   - **Allowed actions**: `npm publish`
+4. Save
+
+The `release.yml` workflow already has the required `id-token: write` permission
+and upgrades npm to a version that supports OIDC. The workflow also passes
+`NODE_AUTH_TOKEN` as a fallback; when Trusted Publishing is active, the OIDC
+flow takes priority and the token is ignored.
+
+### After Trusted Publishing is active
+
+- Delete the `NPM_TOKEN` repository secret from GitHub (Settings > Secrets and
+  variables > Actions) - it is no longer needed. The workflow reference to it
+  is harmless when the secret does not exist.
+- You can also set your npm account to **"Require two-factor authentication and
+  disallow tokens"** for maximum security, since CI no longer uses tokens.
+
+## First publish
+
+The very first publish requires an npm token because Trusted Publishing can only
+be configured on an existing package.
+
+### 1. Create a temporary npm token
 
 1. Go to [npmjs.com/settings/tokens](https://www.npmjs.com/settings/tokens)
 2. Click **Generate New Token** > **Granular Access Token**
 3. Configure:
-   - **Token name**: e.g. `mcp-client-credentials-auth-github`
-   - **Expiration**: 90 days (or your preference)
-   - **Bypass two-factor authentication**: **checked** (required for CI)
-   - **Allowed IP ranges**: leave empty
-   - **Packages and scopes**: `Read and write`, `All packages` or better `mcp-client-credentials-auth` package only
+   - **Token name**: e.g. `mcp-client-credentials-auth-first-publish`
+   - **Expiration**: 1 day (shortest available; this is temporary)
+   - **Packages and scopes**: `Read and write`, `All packages` (the package
+     does not exist yet, so you cannot scope to it)
    - **Organizations**: `No access`
 4. Click **Generate token** and copy the value
-5. Go to **GitHub repo > Settings > Secrets and variables > Actions**
+
+### 2. Add as a GitHub secret
+
+1. Go to **GitHub repo > Settings > Secrets and variables > Actions**
    (https://github.com/velias/mcp-client-credentials-auth/settings/secrets/actions)
-6. Click **New repository secret**:
+2. Click **New repository secret**:
    - **Name**: `NPM_TOKEN`
-   - **Secret**: paste the token value from step 4
+   - **Secret**: paste the token value
 
-## npm token maintenance
+### 3. Publish
 
-The npm token has an **expiration date**. Check it at
-[npmjs.com/settings/tokens](https://www.npmjs.com/settings/tokens).
+Follow the normal release steps (tag and push). The workflow will authenticate
+using the `NPM_TOKEN` secret (the OIDC path is not available yet because
+Trusted Publishing is not configured). Once the first publish succeeds:
 
-**When the token expires, `npm publish` in the release workflow will fail with
-a 401 or 403 or 404 error.**
-
-To rotate:
-
-1. Create a new token on npmjs (same settings as "Initial npm token setup")
-2. Go to **GitHub repo > Settings > Secrets and variables > Actions**
-   (https://github.com/velias/mcp-client-credentials-auth/settings/secrets/actions)
-3. Click the pencil icon next to `NPM_TOKEN`, paste the new value, click
-   **Update secret**
-4. (Optional) Delete the old token on npmjs
-
-Set a calendar reminder for a few days before expiration.
-
-### Recovery: re-run a failed release
-
-If a release workflow fails because the token expired (look for 401/403 in the
-`npm publish` step logs):
-
-1. Rotate the token (see steps above)
-2. Go to the failed workflow run in GitHub Actions
-3. Click **"Re-run failed jobs"** -- the workflow will retry `npm publish` with
-   the updated secret
-
-The git tag and version bump are already in place, so no need to re-tag. The
-GitHub Release may or may not have been created depending on which step failed --
-if it was created, it stays; if not, the re-run will create it.
+1. Configure Trusted Publishing on npmjs.com (see above)
+2. Delete the `NPM_TOKEN` secret from GitHub
 
 ## Hotfix
 
@@ -109,3 +124,16 @@ Same process from a release branch if needed.
 ```bash
 npm login && npm publish --access public
 ```
+
+## Recovery: re-run a failed release
+
+If a release workflow fails (check the `npm publish` step logs):
+
+1. Fix the underlying issue (e.g. Trusted Publishing misconfiguration, or
+   npm outage)
+2. Go to the failed workflow run in GitHub Actions
+3. Click **"Re-run failed jobs"**
+
+The git tag and version bump are already in place, so no need to re-tag. The
+GitHub Release may or may not have been created depending on which step failed;
+if it was created, it stays; if not, the re-run will create it.
