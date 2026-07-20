@@ -222,6 +222,137 @@ describe('TokenManager', () => {
     });
   });
 
+  describe('manual token endpoint', () => {
+    it('enters authenticated mode without calling discovery', async () => {
+      mockDiscoverResource.mockRejectedValue(new Error('Not found'));
+      mockDiscoverAS.mockResolvedValue(undefined);
+
+      const logger = createMockLogger();
+      const config = createTestConfig({
+        tokenEndpoint: 'https://auth.example.com/oauth/token',
+      });
+      const tm = createTokenManager(config, logger);
+
+      await tm.discover();
+
+      expect(tm.getAuthMode().type).toBe('authenticated');
+      expect(tm.getAuthProvider()).toBeDefined();
+      expect(mockDiscoverResource).not.toHaveBeenCalled();
+      expect(mockDiscoverAS).not.toHaveBeenCalled();
+      expect(logger.info).toHaveBeenCalledWith(
+        'Using manual token endpoint (skipping OAuth discovery)',
+        expect.objectContaining({
+          tokenEndpoint: 'https://auth.example.com/oauth/token',
+          scopes: '(none)',
+        }),
+      );
+    });
+
+    it('seeds discoveryState with the configured token_endpoint', async () => {
+      const logger = createMockLogger();
+      const config = createTestConfig({
+        tokenEndpoint: 'https://auth.example.com/oauth/token',
+      });
+      const tm = createTokenManager(config, logger);
+
+      await tm.discover();
+
+      const provider = tm.getAuthProvider() as {
+        discoveryState?: () => { authorizationServerMetadata?: { token_endpoint?: string } };
+      };
+      const state = provider.discoveryState?.();
+      expect(state?.authorizationServerMetadata?.token_endpoint).toBe(
+        'https://auth.example.com/oauth/token',
+      );
+    });
+
+    it('applies scopes from config.scopes', async () => {
+      const logger = createMockLogger();
+      const config = createTestConfig({
+        tokenEndpoint: 'https://auth.example.com/oauth/token',
+        scopes: 'inventory.read orders.write',
+      });
+      const tm = createTokenManager(config, logger);
+
+      await tm.discover();
+
+      const provider = tm.getAuthProvider() as { clientMetadata: { scope?: string } };
+      expect(provider.clientMetadata.scope).toBe('inventory.read orders.write');
+      expect(logger.info).toHaveBeenCalledWith(
+        'Using scopes from MCP_CC_PROXY_SCOPES',
+        expect.objectContaining({ scopes: 'inventory.read orders.write' }),
+      );
+    });
+
+    it('omits scope when config.scopes is not set', async () => {
+      const logger = createMockLogger();
+      const config = createTestConfig({
+        tokenEndpoint: 'https://auth.example.com/oauth/token',
+      });
+      const tm = createTokenManager(config, logger);
+
+      await tm.discover();
+
+      const provider = tm.getAuthProvider() as { clientMetadata: { scope?: string } };
+      expect(provider.clientMetadata.scope).toBeUndefined();
+    });
+
+    it('retries prefetch in the background when IdP is unavailable', async () => {
+      mockAuth
+        .mockRejectedValueOnce(new Error('IdP unavailable'))
+        .mockResolvedValueOnce('AUTHORIZED');
+
+      const logger = createMockLogger();
+      const config = createTestConfig({
+        tokenEndpoint: 'https://auth.example.com/oauth/token',
+      });
+      const tm = createTokenManager(config, logger);
+
+      await tm.discover();
+      await tm.prefetch();
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('Token prefetch failed'),
+        expect.objectContaining({ category: 'authentication', error: 'IdP unavailable' }),
+      );
+      expect(logger.info).toHaveBeenCalledWith(
+        'Scheduling token prefetch retry',
+        expect.objectContaining({ attempt: 1 }),
+      );
+      expect(mockAuth).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      expect(mockAuth).toHaveBeenCalledTimes(2);
+      expect(logger.info).toHaveBeenCalledWith('Token prefetch successful');
+
+      // Successful prefetch clears retry; no further auth() calls on another tick
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(mockAuth).toHaveBeenCalledTimes(2);
+
+      tm.stop();
+    });
+
+    it('does not schedule prefetch retry for discovery path', async () => {
+      setupAuthenticatedDiscovery();
+      mockAuth.mockRejectedValue(new Error('Network error'));
+
+      const logger = createMockLogger();
+      const config = createTestConfig();
+      const tm = createTokenManager(config, logger);
+
+      await tm.discover();
+      await tm.prefetch();
+
+      expect(logger.info).not.toHaveBeenCalledWith(
+        'Scheduling token prefetch retry',
+        expect.anything(),
+      );
+
+      tm.stop();
+    });
+  });
+
   describe('scope resolution', () => {
     it('uses config.scopes over discovered scopes_supported', async () => {
       setupAuthenticatedDiscovery();

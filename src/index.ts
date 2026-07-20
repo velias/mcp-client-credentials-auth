@@ -15,15 +15,24 @@ async function main(): Promise<void> {
     );
   }
 
+  const loopbackHosts = ['localhost', '127.0.0.1', '[::1]'];
+
   const remoteUrl = new URL(config.remoteMcpUrl);
-  if (
-    remoteUrl.protocol === 'http:' &&
-    !['localhost', '127.0.0.1', '[::1]'].includes(remoteUrl.hostname)
-  ) {
+  if (remoteUrl.protocol === 'http:' && !loopbackHosts.includes(remoteUrl.hostname)) {
     logger.warn(
       'Remote MCP Server URL uses cleartext HTTP to a non-loopback host. Access token will travel unencrypted!',
       { url: config.remoteMcpUrl },
     );
+  }
+
+  if (config.tokenEndpoint) {
+    const tokenUrl = new URL(config.tokenEndpoint);
+    if (tokenUrl.protocol === 'http:' && !loopbackHosts.includes(tokenUrl.hostname)) {
+      logger.warn(
+        'Token endpoint URL uses cleartext HTTP to a non-loopback host. Client secret will travel unencrypted!',
+        { url: config.tokenEndpoint },
+      );
+    }
   }
 
   const tokenManager = createTokenManager(config, logger);
