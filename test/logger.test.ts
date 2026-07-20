@@ -30,6 +30,7 @@ describe('Logger', () => {
       expect(stderrSpy).toHaveBeenCalledTimes(1);
       const output = stderrSpy.mock.calls[0][0] as string;
       expect(output).toContain('level=info');
+      expect(output).toContain('component=mcp-client-credentials-auth');
       expect(output).toContain('msg=test message');
       expect(output).toContain('ts=');
       expect(output).toMatch(/\n$/);
@@ -41,6 +42,7 @@ describe('Logger', () => {
 
       const output = stderrSpy.mock.calls[0][0] as string;
       expect(output).toContain('level=warn');
+      expect(output).toContain('component=mcp-client-credentials-auth');
       expect(output).toContain('msg=warning here');
     });
 
@@ -50,7 +52,21 @@ describe('Logger', () => {
 
       const output = stderrSpy.mock.calls[0][0] as string;
       expect(output).toContain('level=error');
+      expect(output).toContain('component=mcp-client-credentials-auth');
       expect(output).toContain('msg=something broke');
+    });
+
+    it('includes category metadata on failure logs', () => {
+      const logger = createLogger();
+      logger.warn('Reconnection failed, will retry', {
+        category: 'authentication',
+        error: 'Invalid scopes: api.graphql',
+      });
+
+      const output = stderrSpy.mock.calls[0][0] as string;
+      expect(output).toContain('component=mcp-client-credentials-auth');
+      expect(output).toContain('category=authentication');
+      expect(output).toContain('error=Invalid scopes: api.graphql');
     });
 
     it('writes debug messages when debug is enabled', () => {
@@ -60,6 +76,7 @@ describe('Logger', () => {
       expect(stderrSpy).toHaveBeenCalledTimes(1);
       const output = stderrSpy.mock.calls[0][0] as string;
       expect(output).toContain('level=debug');
+      expect(output).toContain('component=mcp-client-credentials-auth');
       expect(output).toContain('msg=debug info');
     });
 
@@ -86,8 +103,10 @@ describe('Logger', () => {
       logger.info('nometa', {});
 
       const output = stderrSpy.mock.calls[0][0] as string;
-      // Should be: ts=... level=info msg=nometa\n (no trailing key=value pairs)
-      expect(output).toMatch(/^ts=\S+ level=info msg=nometa\n$/);
+      // Should be: ts=... level=info component=... msg=nometa\n (no trailing key=value pairs)
+      expect(output).toMatch(
+        /^ts=\S+ level=info component=mcp-client-credentials-auth msg=nometa\n$/,
+      );
     });
   });
 

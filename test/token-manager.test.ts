@@ -127,9 +127,13 @@ describe('TokenManager', () => {
       const mode = tm.getAuthMode();
       expect(mode.type).toBe('unsupported-grant');
       if (mode.type === 'unsupported-grant') {
+        expect(mode.message).toContain('mcp-client-credentials-auth [authentication]:');
         expect(mode.message).toContain('does not support client_credentials');
       }
-      expect(logger.error).toHaveBeenCalled();
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.stringContaining('does not support client_credentials'),
+        expect.objectContaining({ category: 'authentication' }),
+      );
     });
 
     it('enters no-auth when resource discovery fails but AS returns no metadata', async () => {
@@ -160,9 +164,15 @@ describe('TokenManager', () => {
 
       await tm.discover();
 
-      expect(tm.getAuthMode().type).toBe('discovery-failed');
+      const mode = tm.getAuthMode();
+      expect(mode.type).toBe('discovery-failed');
+      if (mode.type === 'discovery-failed') {
+        expect(mode.message).toContain('mcp-client-credentials-auth [authentication]:');
+        expect(mode.message).toContain('OAuth discovery failed');
+      }
       expect(logger.warn).toHaveBeenCalledWith(
         expect.stringContaining('OAuth discovery failed'),
+        expect.objectContaining({ category: 'authentication' }),
       );
 
       tm.stop();
@@ -360,7 +370,7 @@ describe('TokenManager', () => {
       await tm.prefetch();
       expect(logger.warn).toHaveBeenCalledWith(
         expect.stringContaining('Token prefetch failed'),
-        expect.any(Object),
+        expect.objectContaining({ category: 'authentication', error: 'Network error' }),
       );
     });
 

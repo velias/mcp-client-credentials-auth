@@ -2,6 +2,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod/v3';
 import type { Config } from '../src/config.js';
 import type { Logger } from '../src/logger.js';
@@ -142,7 +143,7 @@ describe('Proxy auth mode errors', () => {
         { method: 'tools/list', params: {} } as Parameters<typeof endClient.request>[0],
         permissiveSchema,
       ),
-    ).rejects.toThrow();
+    ).rejects.toThrow(/mcp-client-credentials-auth \[authentication\]/);
   });
 
   it('rejects requests when auth mode is discovery-failed', async () => {
@@ -157,7 +158,27 @@ describe('Proxy auth mode errors', () => {
         { method: 'tools/list', params: {} } as Parameters<typeof endClient.request>[0],
         permissiveSchema,
       ),
-    ).rejects.toThrow();
+    ).rejects.toThrow(/mcp-client-credentials-auth \[authentication\]/);
+  });
+
+  it('wraps remote McpError with [remote] category', async () => {
+    const result = await setupProxy();
+    endClient = result.endClient;
+    proxyHandle = result.proxyHandle;
+
+    const upstream = upstreamServers[upstreamServers.length - 1];
+    upstream.fallbackRequestHandler = async () => {
+      throw new McpError(ErrorCode.InvalidParams, 'tool args invalid');
+    };
+
+    await expect(
+      endClient.request(
+        { method: 'tools/call', params: { name: 'x', arguments: {} } } as Parameters<
+          typeof endClient.request
+        >[0],
+        permissiveSchema,
+      ),
+    ).rejects.toThrow(/mcp-client-credentials-auth \[remote\]/);
   });
 });
 

@@ -12,7 +12,17 @@ const permissiveSchema = z.object({}).passthrough();
 let localTransportPair: [InMemoryTransport, InMemoryTransport];
 const upstreamServers: Server[] = [];
 let transportCallCount = 0;
+let sseTransportCallCount = 0;
 let transportShouldFail: (callIndex: number) => boolean = () => false;
+let streamableHttpThrow: ((callIndex: number) => Error | undefined) = () => undefined;
+
+class FakeInvalidScopeError extends Error {
+  readonly errorCode = 'invalid_scope';
+  constructor(message: string) {
+    super(message);
+    this.name = 'InvalidScopeError';
+  }
+}
 
 function createUpstreamServer() {
   const server = new Server(
@@ -46,6 +56,10 @@ vi.mock('@modelcontextprotocol/sdk/client/streamableHttp.js', () => ({
   StreamableHTTPClientTransport: class MockStreamableHTTP {
     constructor() {
       transportCallCount++;
+      const customErr = streamableHttpThrow(transportCallCount);
+      if (customErr) {
+        throw customErr;
+      }
       if (transportShouldFail(transportCallCount)) {
         throw new Error(`Simulated transport failure (call ${transportCallCount})`);
       }
@@ -61,6 +75,7 @@ vi.mock('@modelcontextprotocol/sdk/client/sse.js', () => ({
   SSEClientTransport: class MockSSE {
     constructor() {
       transportCallCount++;
+      sseTransportCallCount++;
       if (transportShouldFail(transportCallCount)) {
         throw new Error(`Simulated SSE transport failure (call ${transportCallCount})`);
       }
@@ -112,10 +127,55 @@ describe('Proxy resilience', () => {
 
   afterEach(async () => {
     transportShouldFail = () => false;
+    streamableHttpThrow = () => undefined;
+    sseTransportCallCount = 0;
     await proxyHandle?.close().catch(() => {});
     await endClient?.close().catch(() => {});
     for (const s of upstreamServers) await s.close().catch(() => {});
     upstreamServers.length = 0;
+  });
+
+  describe('SSE fallback gating', () => {
+    it('does not fall back to SSE when Streamable HTTP fails with an authentication error', async () => {
+      transportCallCount = 0;
+      sseTransportCallCount = 0;
+      upstreamServers.length = 0;
+
+      // Every Streamable HTTP attempt fails with invalid_scope; SSE must never be tried.
+      streamableHttpThrow = () => new FakeInvalidScopeError('Invalid scopes: api.graphql');
+
+      const config = createMockConfig();
+      const logger = createMockLogger();
+      const tokenManager = createMockTokenManager();
+
+      const { createProxy } = await import('../src/proxy.js');
+      proxyHandle = await createProxy(config, tokenManager, logger);
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        'Streamable HTTP connection failed, not trying SSE fallback',
+        expect.objectContaining({
+          category: 'authentication',
+          error: 'Invalid scopes: api.graphql',
+        }),
+      );
+      expect(sseTransportCallCount).toBe(0);
+
+      endClient = new Client(
+        { name: 'test-client', version: '2.5.0' },
+        { capabilities: { sampling: {} } },
+      );
+      await endClient.connect(localTransportPair[0]);
+      await new Promise((r) => setTimeout(r, 80));
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        'Streamable HTTP failed, not trying SSE fallback',
+        expect.objectContaining({
+          category: 'authentication',
+          error: 'Invalid scopes: api.graphql',
+        }),
+      );
+      expect(sseTransportCallCount).toBe(0);
+    });
   });
 
   describe('Phase 1 discovery failure', () => {
@@ -284,7 +344,7 @@ describe('Proxy resilience', () => {
           { method: 'tools/list', params: {} } as Parameters<typeof endClient.request>[0],
           permissiveSchema,
         ),
-      ).rejects.toThrow(/temporarily unavailable/);
+      ).rejects.toThrow(/mcp-client-credentials-auth \[connection\].*temporarily unavailable/);
     });
   });
 

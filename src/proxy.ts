@@ -8,6 +8,13 @@ import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import type { ClientCapabilities, Implementation, ServerCapabilities } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod/v3';
 import type { Config } from './config.js';
+import {
+  PROXY_NAME,
+  classifyError,
+  errorDetail,
+  toClientError,
+  wrapCaughtError,
+} from './errors.js';
 import type { Logger } from './logger.js';
 import type { TokenManager } from './token-manager.js';
 
@@ -15,7 +22,6 @@ const pkg = JSON.parse(
   readFileSync(resolve(__dirname, '..', 'package.json'), 'utf-8'),
 ) as { version: string };
 export const PKG_VERSION = pkg.version;
-const PROXY_NAME = 'mcp-client-credentials-auth';
 const CLIENT_CREDENTIALS_EXTENSION = 'io.modelcontextprotocol/oauth-client-credentials';
 
 const permissiveSchema = z.object({}).passthrough();
@@ -64,6 +70,11 @@ function buildClientIdentity(localClientInfo: Implementation | undefined): Imple
   return { name: PROXY_NAME, version: PKG_VERSION };
 }
 
+/** SSE uses the same authProvider; only retry on transport-shaped failures. */
+function shouldFallbackToSse(err: unknown): boolean {
+  return classifyError(err) === 'connection';
+}
+
 export interface ProxyHandle {
   close(): Promise<void>;
 }
@@ -94,8 +105,18 @@ export async function createProxy(
       await discoveryClient.connect(httpTransport);
       logger.info('Discovery: connected via Streamable HTTP');
     } catch (httpErr) {
-      logger.info('Streamable HTTP connection failed, trying SSE fallback', {
-        error: httpErr instanceof Error ? httpErr.message : String(httpErr),
+      const detail = errorDetail(httpErr);
+      const category = classifyError(httpErr);
+      if (!shouldFallbackToSse(httpErr)) {
+        logger.warn('Streamable HTTP connection failed, not trying SSE fallback', {
+          category,
+          error: detail,
+        });
+        throw httpErr;
+      }
+      logger.warn('Streamable HTTP connection failed, trying SSE fallback', {
+        category,
+        error: detail,
       });
       const sseTransport = new SSEClientTransport(remoteUrl, {
         authProvider,
@@ -109,10 +130,12 @@ export async function createProxy(
     await discoveryClient.close();
     logger.debug('Discovery connection closed');
   } catch (err) {
+    const detail = errorDetail(err);
+    const category = classifyError(err);
     logger.warn(
       'Remote MCP server unreachable during discovery; starting with default capabilities. ' +
       'Will attempt connection when local client connects.',
-      { error: err instanceof Error ? err.message : String(err) },
+      { category, error: detail },
     );
     discoveredCapabilities = { tools: {}, resources: {}, prompts: {} };
   }
@@ -147,8 +170,18 @@ export async function createProxy(
         clientName: identity.name,
       });
     } catch (httpErr) {
-      logger.info('Streamable HTTP failed, trying SSE fallback', {
-        error: httpErr instanceof Error ? httpErr.message : String(httpErr),
+      const detail = errorDetail(httpErr);
+      const category = classifyError(httpErr);
+      if (!shouldFallbackToSse(httpErr)) {
+        logger.warn('Streamable HTTP failed, not trying SSE fallback', {
+          category,
+          error: detail,
+        });
+        throw httpErr;
+      }
+      logger.warn('Streamable HTTP failed, trying SSE fallback', {
+        category,
+        error: detail,
       });
       const sseTransport = new SSEClientTransport(remoteUrl, {
         authProvider,
@@ -275,8 +308,11 @@ export async function createProxy(
       }
       reconnectAttempt = 0;
     } catch (err) {
+      const detail = errorDetail(err);
+      const category = classifyError(err);
       logger.warn('Reconnection failed, will retry', {
-        error: err instanceof Error ? err.message : String(err),
+        category,
+        error: detail,
         attempt: reconnectAttempt + 1,
       });
       remoteClient = undefined;
@@ -318,8 +354,11 @@ export async function createProxy(
         startPolling();
         readyResolve();
       } catch (err) {
+        const detail = errorDetail(err);
+        const category = classifyError(err);
         logger.warn('Failed to establish real remote connection, scheduling reconnection', {
-          error: err instanceof Error ? err.message : String(err),
+          category,
+          error: detail,
         });
         readyResolve();
         void reconnect();
@@ -333,22 +372,32 @@ export async function createProxy(
 
     const authMode = tokenManager.getAuthMode();
     if (authMode.type === 'unsupported-grant') {
-      throw new Error(authMode.message);
+      throw toClientError('authentication', authMode.message);
     }
     if (authMode.type === 'discovery-failed') {
-      throw new Error(authMode.message);
+      throw toClientError('authentication', authMode.message);
     }
 
     if (!remoteClient) {
-      throw new Error('Remote MCP server temporarily unavailable (reconnecting)');
+      throw toClientError('connection', 'temporarily unavailable (reconnecting)');
     }
 
     const sanitizedParams = sanitizeMeta(request.params);
-    return remoteClient.request(
-      { method: request.method, params: sanitizedParams },
-      permissiveSchema,
-      { timeout: config.requestTimeoutMs },
-    );
+    try {
+      return await remoteClient.request(
+        { method: request.method, params: sanitizedParams },
+        permissiveSchema,
+        { timeout: config.requestTimeoutMs },
+      );
+    } catch (err) {
+      const category = classifyError(err);
+      logger.warn('Remote request failed', {
+        category,
+        method: request.method,
+        error: errorDetail(err),
+      });
+      throw wrapCaughtError(err);
+    }
   };
 
   // Flow 4: Client->Server NOTIFICATIONS
@@ -444,8 +493,11 @@ export async function createProxy(
           lastPromptsHash = hash;
         }
       } catch (err) {
+        const detail = errorDetail(err);
+        const category = classifyError(err);
         logger.warn('Capabilities poll failed', {
-          error: err instanceof Error ? err.message : String(err),
+          category,
+          error: detail,
         });
       }
     };
