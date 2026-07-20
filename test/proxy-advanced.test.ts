@@ -70,6 +70,7 @@ function createMockConfig(overrides?: Partial<Config>): Config {
     clientSecret: 'test-secret',
     refreshSkewSeconds: 30,
     requestTimeoutMs: 30000,
+    startupTimeoutMs: 60000,
     capabilitiesPollSeconds: 0,
     debug: false,
     ...overrides,
@@ -86,10 +87,16 @@ function createMockLogger(): Logger {
   };
 }
 
-function createMockTokenManager(mode: AuthMode = { type: 'authenticated', provider: {} as never }): TokenManager {
+function createMockTokenManager(
+  mode: AuthMode = { type: 'authenticated', provider: {} as never },
+  opts?: { hasUsableAccessToken?: boolean },
+): TokenManager {
+  const hasToken = opts?.hasUsableAccessToken ?? mode.type === 'authenticated';
   return {
     discover: vi.fn(),
     prefetch: vi.fn(),
+    waitUntilAuthReady: vi.fn().mockResolvedValue(undefined),
+    hasUsableAccessToken: vi.fn().mockReturnValue(hasToken),
     getAuthProvider: vi.fn().mockReturnValue(mode.type === 'authenticated' ? {} : undefined),
     getAuthMode: vi.fn().mockReturnValue(mode),
     invalidate: vi.fn(),
@@ -97,13 +104,19 @@ function createMockTokenManager(mode: AuthMode = { type: 'authenticated', provid
   };
 }
 
-async function setupProxy(opts?: { config?: Partial<Config>; authMode?: AuthMode }) {
+async function setupProxy(opts?: {
+  config?: Partial<Config>;
+  authMode?: AuthMode;
+  hasUsableAccessToken?: boolean;
+}) {
 
   upstreamServers.length = 0;
 
   const config = createMockConfig(opts?.config);
   const logger = createMockLogger();
-  const tokenManager = createMockTokenManager(opts?.authMode);
+  const tokenManager = createMockTokenManager(opts?.authMode, {
+    hasUsableAccessToken: opts?.hasUsableAccessToken,
+  });
 
   const { createProxy } = await import('../src/proxy.js');
   const proxyHandle = await createProxy(config, tokenManager, logger);
@@ -131,9 +144,10 @@ describe('Proxy auth mode errors', () => {
     upstreamServers.length = 0;
   });
 
-  it('rejects requests when auth mode is unsupported-grant', async () => {
+  it('rejects requests when authenticated mode has no usable access token', async () => {
     const result = await setupProxy({
-      authMode: { type: 'unsupported-grant', message: 'IdP does not support client_credentials' },
+      authMode: { type: 'authenticated', provider: {} as never },
+      hasUsableAccessToken: false,
     });
     endClient = result.endClient;
     proxyHandle = result.proxyHandle;
@@ -143,22 +157,7 @@ describe('Proxy auth mode errors', () => {
         { method: 'tools/list', params: {} } as Parameters<typeof endClient.request>[0],
         permissiveSchema,
       ),
-    ).rejects.toThrow(/mcp-client-credentials-auth \[authentication\]/);
-  });
-
-  it('rejects requests when auth mode is discovery-failed', async () => {
-    const result = await setupProxy({
-      authMode: { type: 'discovery-failed', message: 'Discovery not attempted' },
-    });
-    endClient = result.endClient;
-    proxyHandle = result.proxyHandle;
-
-    await expect(
-      endClient.request(
-        { method: 'tools/list', params: {} } as Parameters<typeof endClient.request>[0],
-        permissiveSchema,
-      ),
-    ).rejects.toThrow(/mcp-client-credentials-auth \[authentication\]/);
+    ).rejects.toThrow(/mcp-client-credentials-auth \[authentication\]: no usable access token/);
   });
 
   it('wraps remote McpError with [remote] category', async () => {

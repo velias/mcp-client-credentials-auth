@@ -5,6 +5,9 @@ import {
   PROXY_NAME,
   classifyError,
   formatProxyError,
+  formatUnrecoverableOAuthMisconfig,
+  isPermanentOAuthConfigError,
+  isUnrecoverableStartupAuthError,
   toClientError,
   wrapCaughtError,
 } from '../src/errors.js';
@@ -29,6 +32,75 @@ describe('errors', () => {
       expect(formatProxyError('remote', 'tool failed')).toBe(
         `${PROXY_NAME} [remote]: tool failed`,
       );
+    });
+  });
+
+  describe('isPermanentOAuthConfigError', () => {
+    it('returns true for invalid_scope and invalid_client', () => {
+      expect(isPermanentOAuthConfigError(new FakeInvalidScopeError('Invalid scopes: api.graphql'))).toBe(
+        true,
+      );
+      class FakeInvalidClientError extends Error {
+        readonly errorCode = 'invalid_client';
+      }
+      expect(isPermanentOAuthConfigError(new FakeInvalidClientError('bad secret'))).toBe(true);
+    });
+
+    it('returns false for transient or unknown errors', () => {
+      class FakeServerError extends Error {
+        readonly errorCode = 'server_error';
+      }
+      expect(isPermanentOAuthConfigError(new FakeServerError('IdP busy'))).toBe(false);
+      expect(isPermanentOAuthConfigError(new Error('ECONNREFUSED'))).toBe(false);
+      expect(isPermanentOAuthConfigError(new UnauthorizedError('Unauthorized'))).toBe(false);
+    });
+  });
+
+  describe('formatUnrecoverableOAuthMisconfig', () => {
+    it('names the IdP when the token request was rejected', () => {
+      const message = formatUnrecoverableOAuthMisconfig('Invalid scopes: api.graphql', 'idp');
+      expect(message).toContain('at the identity provider (IdP)');
+      expect(message).toContain('The IdP rejected the token request (not the MCP server)');
+      expect(message).toContain('contact your MCP server provider');
+      expect(message).toContain('MCP_CC_PROXY_SCOPES');
+    });
+
+    it('names the remote MCP server when the Bearer token was rejected', () => {
+      const message = formatUnrecoverableOAuthMisconfig('Unauthorized', 'mcp-server');
+      expect(message).toContain('at the remote MCP server');
+      expect(message).toContain('The MCP server rejected the access token');
+      expect(message).toContain('not an IdP token-request failure');
+      expect(message).toContain('contact your MCP server provider');
+    });
+  });
+
+  describe('isUnrecoverableStartupAuthError', () => {
+    it('is true for IdP permanent errors and remote UnauthorizedError', () => {
+      expect(
+        isUnrecoverableStartupAuthError(new FakeInvalidScopeError('Invalid scopes: api.graphql')),
+      ).toBe(true);
+      expect(isUnrecoverableStartupAuthError(new UnauthorizedError('Unauthorized'))).toBe(true);
+    });
+
+    it('is true for resource-server invalid_token / insufficient_scope', () => {
+      class FakeInvalidTokenError extends Error {
+        readonly errorCode = 'invalid_token';
+      }
+      class FakeInsufficientScopeError extends Error {
+        readonly errorCode = 'insufficient_scope';
+      }
+      expect(isUnrecoverableStartupAuthError(new FakeInvalidTokenError('bad token'))).toBe(true);
+      expect(isUnrecoverableStartupAuthError(new FakeInsufficientScopeError('need more'))).toBe(
+        true,
+      );
+    });
+
+    it('is false for transient connection failures', () => {
+      expect(isUnrecoverableStartupAuthError(new Error('ECONNREFUSED'))).toBe(false);
+      class FakeServerError extends Error {
+        readonly errorCode = 'server_error';
+      }
+      expect(isUnrecoverableStartupAuthError(new FakeServerError('IdP busy'))).toBe(false);
     });
   });
 

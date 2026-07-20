@@ -78,6 +78,7 @@ function createMockConfig(overrides?: Partial<Config>): Config {
     clientSecret: 'test-secret',
     refreshSkewSeconds: 30,
     requestTimeoutMs: 30000,
+    startupTimeoutMs: 60000,
     capabilitiesPollSeconds: 0,
     debug: false,
     ...overrides,
@@ -98,6 +99,8 @@ function createMockTokenManager(mode: AuthMode = { type: 'authenticated', provid
   return {
     discover: vi.fn(),
     prefetch: vi.fn(),
+    waitUntilAuthReady: vi.fn().mockResolvedValue(undefined),
+    hasUsableAccessToken: vi.fn().mockReturnValue(mode.type === 'authenticated'),
     getAuthProvider: vi.fn().mockReturnValue(mode.type === 'authenticated' ? {} : undefined),
     getAuthMode: vi.fn().mockReturnValue(mode),
     invalidate: vi.fn(),

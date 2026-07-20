@@ -14,7 +14,12 @@ import type {
   AuthorizationServerMetadata,
 } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { Config } from './config.js';
-import { formatProxyError } from './errors.js';
+import {
+  errorDetail,
+  formatProxyError,
+  formatUnrecoverableOAuthMisconfig,
+  isPermanentOAuthConfigError,
+} from './errors.js';
 import type { Logger } from './logger.js';
 
 export type AuthMode =
@@ -26,19 +31,27 @@ export type AuthMode =
 export interface TokenManager {
   discover(): Promise<void>;
   prefetch(): Promise<void>;
+  waitUntilAuthReady(deadlineMs: number): Promise<void>;
+  hasUsableAccessToken(): boolean;
   getAuthProvider(): OAuthClientProvider | undefined;
   getAuthMode(): AuthMode;
   invalidate(): void;
   stop(): void;
 }
 
-const REDISCOVERY_BASE_MS = 5000;
-const REDISCOVERY_MAX_MS = 60000;
+const AUTH_RETRY_BASE_MS = 5000;
+const AUTH_RETRY_MAX_MS = 60000;
 
 function getBackoffDelay(attempt: number, baseMs: number, maxMs: number): number {
   const exponential = Math.min(baseMs * 2 ** attempt, maxMs);
   const jitter = Math.random() * exponential * 0.3;
   return Math.round(exponential + jitter);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 function seedManualDiscoveryState(
@@ -81,10 +94,6 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
   let authServerMetadata: AuthorizationServerMetadata | undefined;
   let refreshTimer: ReturnType<typeof setTimeout> | undefined;
   let inflightRefresh: Promise<void> | undefined;
-  let rediscoveryTimer: ReturnType<typeof setTimeout> | undefined;
-  let rediscoveryAttempt = 0;
-  let prefetchRetryTimer: ReturnType<typeof setTimeout> | undefined;
-  let prefetchRetryAttempt = 0;
 
   const timeoutFetch: typeof globalThis.fetch = (input, init) => {
     const signal = config.requestTimeoutMs
@@ -92,62 +101,6 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
       : undefined;
     return fetch(input, { ...init, signal });
   };
-
-  function clearPrefetchRetry(): void {
-    if (prefetchRetryTimer) {
-      clearTimeout(prefetchRetryTimer);
-      prefetchRetryTimer = undefined;
-    }
-    prefetchRetryAttempt = 0;
-  }
-
-  function schedulePrefetchRetry(): void {
-    if (prefetchRetryTimer || !config.tokenEndpoint) return;
-    const delayMs = getBackoffDelay(prefetchRetryAttempt, REDISCOVERY_BASE_MS, REDISCOVERY_MAX_MS);
-    logger.info('Scheduling token prefetch retry', {
-      attempt: prefetchRetryAttempt + 1,
-      delayMs,
-    });
-    prefetchRetryTimer = setTimeout(() => {
-      prefetchRetryTimer = undefined;
-      prefetchRetryAttempt++;
-      void prefetch();
-    }, delayMs);
-  }
-
-  function scheduleRediscovery(): void {
-    if (rediscoveryTimer) return;
-    const delayMs = getBackoffDelay(rediscoveryAttempt, REDISCOVERY_BASE_MS, REDISCOVERY_MAX_MS);
-    logger.info('Scheduling OAuth re-discovery', {
-      attempt: rediscoveryAttempt + 1,
-      delayMs,
-    });
-    rediscoveryTimer = setTimeout(() => {
-      rediscoveryTimer = undefined;
-      void performRediscovery();
-    }, delayMs);
-  }
-
-  async function performRediscovery(): Promise<void> {
-    rediscoveryAttempt++;
-    logger.info('Starting OAuth re-discovery', { attempt: rediscoveryAttempt });
-    try {
-      await discover();
-      if (authMode.type === 'authenticated') {
-        logger.info('OAuth re-discovery succeeded, attempting token prefetch');
-        await prefetch();
-      }
-    } catch (err) {
-      logger.warn('OAuth re-discovery failed', {
-        category: 'authentication',
-        error: err instanceof Error ? err.message : String(err),
-        attempt: rediscoveryAttempt,
-      });
-    }
-    if (authMode.type === 'discovery-failed') {
-      scheduleRediscovery();
-    }
-  }
 
   function createAuthenticatedProvider(scopes: string | undefined): ClientCredentialsProvider {
     const p = new ClientCredentialsProvider({
@@ -216,11 +169,10 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
     if (!authServerMetadata) {
       if (resourceDiscoveryFailed && asDiscoveryFailed) {
         const detail =
-          'OAuth discovery failed (both resource and authorization server endpoints unreachable). Requests will be rejected until discovery succeeds.';
+          'OAuth discovery failed (both resource and authorization server endpoints unreachable)';
         const msg = formatProxyError('authentication', detail);
         logger.warn(msg, { category: 'authentication' });
         authMode = { type: 'discovery-failed', message: msg };
-        scheduleRediscovery();
         return;
       }
 
@@ -228,7 +180,6 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
         'Remote server does not announce auth requirements -- proxying without authentication',
       );
       authMode = { type: 'no-auth' };
-      rediscoveryAttempt = 0;
       return;
     }
 
@@ -255,7 +206,6 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
     provider = createAuthenticatedProvider(currentScopes);
 
     authMode = { type: 'authenticated', provider };
-    rediscoveryAttempt = 0;
     logger.info('OAuth discovery complete', {
       tokenEndpoint: authServerMetadata.token_endpoint,
       scopes: currentScopes ?? '(default)',
@@ -353,17 +303,86 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
       const result = await auth(provider, { serverUrl: config.remoteMcpUrl, fetchFn: timeoutFetch });
       if (result === 'AUTHORIZED') {
         logger.info('Token prefetch successful');
-        clearPrefetchRetry();
       }
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      logger.warn('Token prefetch failed (will retry on first request)', {
+      const message = errorDetail(err);
+      logger.warn('Token prefetch failed', {
         category: 'authentication',
         error: message,
       });
-      if (config.tokenEndpoint) {
-        schedulePrefetchRetry();
+      if (isPermanentOAuthConfigError(err)) {
+        throw err;
       }
+    }
+  }
+
+  function hasUsableAccessToken(): boolean {
+    if (authMode.type !== 'authenticated' || !provider) {
+      return false;
+    }
+    const tokens = provider.tokens();
+    return typeof tokens?.access_token === 'string' && tokens.access_token.length > 0;
+  }
+
+  async function waitUntilAuthReady(deadlineMs: number): Promise<void> {
+    let attempt = 0;
+    while (true) {
+      await discover();
+      const mode = authMode;
+
+      if (mode.type === 'unsupported-grant') {
+        throw new Error(mode.message);
+      }
+
+      if (mode.type === 'no-auth') {
+        logger.info('Auth readiness: no-auth mode (token not required)');
+        return;
+      }
+
+      if (mode.type === 'authenticated') {
+        try {
+          await prefetch();
+        } catch (err) {
+          if (isPermanentOAuthConfigError(err)) {
+            const message = formatUnrecoverableOAuthMisconfig(errorDetail(err), 'idp');
+            logger.error(message, {
+              category: 'authentication',
+              unrecoverable: true,
+              failureSource: 'idp',
+              error: errorDetail(err),
+            });
+            throw new Error(message, { cause: err });
+          }
+          // Transient prefetch failure: fall through to deadline/retry below.
+        }
+        if (hasUsableAccessToken()) {
+          logger.info('Auth readiness: usable access token acquired');
+          return;
+        }
+      }
+
+      const remaining = deadlineMs - Date.now();
+      if (remaining <= 0) {
+        const detail =
+          mode.type === 'discovery-failed'
+            ? 'OAuth discovery did not succeed within startup timeout'
+            : 'No usable access token within startup timeout';
+        throw new Error(formatProxyError('authentication', detail));
+      }
+
+      const delayMs = Math.min(
+        getBackoffDelay(attempt, AUTH_RETRY_BASE_MS, AUTH_RETRY_MAX_MS),
+        remaining,
+      );
+      logger.info('Auth not ready, retrying before startup deadline', {
+        category: 'authentication',
+        authMode: mode.type,
+        attempt: attempt + 1,
+        delayMs,
+        remainingMs: remaining,
+      });
+      await sleep(delayMs);
+      attempt++;
     }
   }
 
@@ -372,11 +391,6 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
       clearTimeout(refreshTimer);
       refreshTimer = undefined;
     }
-    if (rediscoveryTimer) {
-      clearTimeout(rediscoveryTimer);
-      rediscoveryTimer = undefined;
-    }
-    clearPrefetchRetry();
     if (provider) {
       provider.saveTokens({ access_token: '', token_type: 'bearer' });
     }
@@ -387,11 +401,6 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
       clearTimeout(refreshTimer);
       refreshTimer = undefined;
     }
-    if (rediscoveryTimer) {
-      clearTimeout(rediscoveryTimer);
-      rediscoveryTimer = undefined;
-    }
-    clearPrefetchRetry();
   }
 
   function getAuthProvider(): OAuthClientProvider | undefined {
@@ -408,6 +417,8 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
   return {
     discover,
     prefetch,
+    waitUntilAuthReady,
+    hasUsableAccessToken,
     getAuthProvider,
     getAuthMode,
     invalidate,

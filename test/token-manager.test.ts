@@ -1,7 +1,16 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import type { AuthorizationServerMetadata } from '@modelcontextprotocol/sdk/shared/auth.js';
 import { createTokenManager } from '../src/token-manager.js';
 import type { Config } from '../src/config.js';
 import type { Logger } from '../src/logger.js';
+
+/** Partial AS metadata for tests; SDK type requires many OIDC fields we do not exercise. */
+function asMetadata(
+  partial: Pick<AuthorizationServerMetadata, 'issuer' | 'token_endpoint'> &
+    Partial<AuthorizationServerMetadata>,
+): AuthorizationServerMetadata {
+  return partial as AuthorizationServerMetadata;
+}
 
 vi.mock('@modelcontextprotocol/sdk/client/auth.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@modelcontextprotocol/sdk/client/auth.js')>();
@@ -40,6 +49,7 @@ function createTestConfig(overrides?: Partial<Config>): Config {
     clientSecret: 'test-secret',
     refreshSkewSeconds: 30,
     requestTimeoutMs: 30000,
+    startupTimeoutMs: 60000,
     capabilitiesPollSeconds: 60,
     debug: false,
     ...overrides,
@@ -52,12 +62,14 @@ function setupAuthenticatedDiscovery(): void {
     authorization_servers: ['https://auth.example.com'],
     scopes_supported: ['read', 'write'],
   });
-  mockDiscoverAS.mockResolvedValue({
-    issuer: 'https://auth.example.com',
-    token_endpoint: 'https://auth.example.com/token',
-    grant_types_supported: ['client_credentials', 'authorization_code'],
-    token_endpoint_auth_methods_supported: ['client_secret_basic'],
-  });
+  mockDiscoverAS.mockResolvedValue(
+    asMetadata({
+      issuer: 'https://auth.example.com',
+      token_endpoint: 'https://auth.example.com/token',
+      grant_types_supported: ['client_credentials', 'authorization_code'],
+      token_endpoint_auth_methods_supported: ['client_secret_basic'],
+    }),
+  );
 }
 
 describe('TokenManager', () => {
@@ -112,11 +124,13 @@ describe('TokenManager', () => {
         resource: 'https://mcp.example.com/mcp',
         authorization_servers: ['https://auth.example.com'],
       });
-      mockDiscoverAS.mockResolvedValue({
-        issuer: 'https://auth.example.com',
-        token_endpoint: 'https://auth.example.com/token',
-        grant_types_supported: ['authorization_code'],
-      });
+      mockDiscoverAS.mockResolvedValue(
+        asMetadata({
+          issuer: 'https://auth.example.com',
+          token_endpoint: 'https://auth.example.com/token',
+          grant_types_supported: ['authorization_code'],
+        }),
+      );
 
       const logger = createMockLogger();
       const config = createTestConfig();
@@ -178,46 +192,167 @@ describe('TokenManager', () => {
       tm.stop();
     });
 
-    it('schedules re-discovery when both endpoints fail', async () => {
-      mockDiscoverResource.mockRejectedValue(new Error('ECONNREFUSED'));
-      mockDiscoverAS.mockRejectedValue(new Error('ECONNREFUSED'));
+  });
+
+  describe('waitUntilAuthReady', () => {
+    it('returns immediately for no-auth mode', async () => {
+      mockDiscoverResource.mockRejectedValue(new Error('Not found'));
+      mockDiscoverAS.mockResolvedValue(undefined);
 
       const logger = createMockLogger();
       const config = createTestConfig();
       const tm = createTokenManager(config, logger);
 
-      await tm.discover();
+      await tm.waitUntilAuthReady(Date.now() + 60_000);
 
+      expect(tm.getAuthMode().type).toBe('no-auth');
       expect(logger.info).toHaveBeenCalledWith(
-        'Scheduling OAuth re-discovery',
-        expect.objectContaining({ attempt: 1 }),
+        'Auth readiness: no-auth mode (token not required)',
       );
-
       tm.stop();
     });
 
-    it('recovers from discovery-failed when re-discovery succeeds', async () => {
-      mockDiscoverResource.mockRejectedValue(new Error('ECONNREFUSED'));
-      mockDiscoverAS.mockRejectedValue(new Error('ECONNREFUSED'));
+    it('fails immediately on unsupported-grant', async () => {
+      mockDiscoverResource.mockResolvedValue({
+        resource: 'https://mcp.example.com/mcp',
+        authorization_servers: ['https://auth.example.com'],
+      });
+      mockDiscoverAS.mockResolvedValue(
+        asMetadata({
+          issuer: 'https://auth.example.com',
+          token_endpoint: 'https://auth.example.com/token',
+          grant_types_supported: ['authorization_code'],
+          token_endpoint_auth_methods_supported: ['client_secret_basic'],
+        }),
+      );
+
+      const logger = createMockLogger();
+      const config = createTestConfig();
+      const tm = createTokenManager(config, logger);
+
+      await expect(tm.waitUntilAuthReady(Date.now() + 60_000)).rejects.toThrow(
+        /does not support client_credentials/,
+      );
+      tm.stop();
+    });
+
+    it('retries discovery-failed until success within the deadline', async () => {
+      mockDiscoverResource.mockRejectedValueOnce(new Error('ECONNREFUSED'));
+      mockDiscoverAS.mockRejectedValueOnce(new Error('ECONNREFUSED'));
+
+      const logger = createMockLogger();
+      const config = createTestConfig();
+      const tm = createTokenManager(config, logger);
+
+      const ready = tm.waitUntilAuthReady(Date.now() + 60_000);
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(tm.getAuthMode().type).toBe('discovery-failed');
+
+      setupAuthenticatedDiscovery();
+      mockAuth.mockImplementation(async (provider) => {
+        void provider.saveTokens({ access_token: 'tok', token_type: 'bearer', expires_in: 3600 });
+        return 'AUTHORIZED';
+      });
+
+      await vi.advanceTimersByTimeAsync(10_000);
+      await ready;
+
+      expect(tm.getAuthMode().type).toBe('authenticated');
+      expect(tm.hasUsableAccessToken()).toBe(true);
+      expect(logger.info).toHaveBeenCalledWith(
+        'Auth readiness: usable access token acquired',
+      );
+      tm.stop();
+    });
+
+    it('throws when no usable token within the deadline', async () => {
+      setupAuthenticatedDiscovery();
+      mockAuth.mockRejectedValue(new Error('IdP unavailable'));
+
+      const logger = createMockLogger();
+      const config = createTestConfig();
+      const tm = createTokenManager(config, logger);
+
+      const ready = tm.waitUntilAuthReady(Date.now() + 100);
+      const assertion = expect(ready).rejects.toThrow(/No usable access token within startup timeout/);
+      await vi.advanceTimersByTimeAsync(200);
+      await assertion;
+      tm.stop();
+    });
+
+    it('fails immediately on permanent OAuth config errors without retrying', async () => {
+      setupAuthenticatedDiscovery();
+      class FakeInvalidScopeError extends Error {
+        readonly errorCode = 'invalid_scope';
+        constructor(message: string) {
+          super(message);
+          this.name = 'InvalidScopeError';
+        }
+      }
+      mockAuth.mockRejectedValue(new FakeInvalidScopeError('Invalid scopes: api.graphql'));
+
+      const logger = createMockLogger();
+      const config = createTestConfig();
+      const tm = createTokenManager(config, logger);
+
+      await expect(tm.waitUntilAuthReady(Date.now() + 60_000)).rejects.toThrow(
+        /Unrecoverable OAuth misconfiguration at the identity provider \(IdP\): Invalid scopes: api\.graphql/,
+      );
+      expect(mockAuth).toHaveBeenCalledTimes(1);
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.stringMatching(
+          /at the identity provider \(IdP\): Invalid scopes: api\.graphql.*IdP rejected the token request/,
+        ),
+        expect.objectContaining({
+          category: 'authentication',
+          unrecoverable: true,
+          failureSource: 'idp',
+          error: 'Invalid scopes: api.graphql',
+        }),
+      );
+      expect(logger.info).not.toHaveBeenCalledWith(
+        'Auth not ready, retrying before startup deadline',
+        expect.anything(),
+      );
+      tm.stop();
+    });
+  });
+
+  describe('hasUsableAccessToken', () => {
+    it('is true after successful prefetch that stores a token', async () => {
+      setupAuthenticatedDiscovery();
+      mockAuth.mockImplementation(async (provider) => {
+        void provider.saveTokens({ access_token: 'tok', token_type: 'bearer', expires_in: 3600 });
+        return 'AUTHORIZED';
+      });
 
       const logger = createMockLogger();
       const config = createTestConfig();
       const tm = createTokenManager(config, logger);
 
       await tm.discover();
-      expect(tm.getAuthMode().type).toBe('discovery-failed');
+      expect(tm.hasUsableAccessToken()).toBe(false);
+      await tm.prefetch();
+      expect(tm.hasUsableAccessToken()).toBe(true);
+      tm.stop();
+    });
 
+    it('is false after invalidate', async () => {
       setupAuthenticatedDiscovery();
-      mockAuth.mockResolvedValue('AUTHORIZED');
+      mockAuth.mockImplementation(async (provider) => {
+        void provider.saveTokens({ access_token: 'tok', token_type: 'bearer', expires_in: 3600 });
+        return 'AUTHORIZED';
+      });
 
-      await vi.advanceTimersByTimeAsync(10_000);
+      const logger = createMockLogger();
+      const config = createTestConfig();
+      const tm = createTokenManager(config, logger);
 
-      expect(tm.getAuthMode().type).toBe('authenticated');
-      expect(tm.getAuthProvider()).toBeDefined();
-      expect(logger.info).toHaveBeenCalledWith(
-        'OAuth re-discovery succeeded, attempting token prefetch',
-      );
-
+      await tm.discover();
+      await tm.prefetch();
+      tm.invalidate();
+      expect(tm.hasUsableAccessToken()).toBe(false);
       tm.stop();
     });
   });
@@ -297,10 +432,13 @@ describe('TokenManager', () => {
       expect(provider.clientMetadata.scope).toBeUndefined();
     });
 
-    it('retries prefetch in the background when IdP is unavailable', async () => {
+    it('acquires a token via waitUntilAuthReady when IdP recovers', async () => {
       mockAuth
         .mockRejectedValueOnce(new Error('IdP unavailable'))
-        .mockResolvedValueOnce('AUTHORIZED');
+        .mockImplementation(async (provider) => {
+          void provider.saveTokens({ access_token: 'tok', token_type: 'bearer', expires_in: 3600 });
+          return 'AUTHORIZED';
+        });
 
       const logger = createMockLogger();
       const config = createTestConfig({
@@ -308,47 +446,14 @@ describe('TokenManager', () => {
       });
       const tm = createTokenManager(config, logger);
 
-      await tm.discover();
-      await tm.prefetch();
-
-      expect(logger.warn).toHaveBeenCalledWith(
-        expect.stringContaining('Token prefetch failed'),
-        expect.objectContaining({ category: 'authentication', error: 'IdP unavailable' }),
-      );
-      expect(logger.info).toHaveBeenCalledWith(
-        'Scheduling token prefetch retry',
-        expect.objectContaining({ attempt: 1 }),
-      );
-      expect(mockAuth).toHaveBeenCalledTimes(1);
-
+      const ready = tm.waitUntilAuthReady(Date.now() + 60_000);
       await vi.advanceTimersByTimeAsync(10_000);
+      await ready;
 
-      expect(mockAuth).toHaveBeenCalledTimes(2);
-      expect(logger.info).toHaveBeenCalledWith('Token prefetch successful');
-
-      // Successful prefetch clears retry; no further auth() calls on another tick
-      await vi.advanceTimersByTimeAsync(60_000);
-      expect(mockAuth).toHaveBeenCalledTimes(2);
-
-      tm.stop();
-    });
-
-    it('does not schedule prefetch retry for discovery path', async () => {
-      setupAuthenticatedDiscovery();
-      mockAuth.mockRejectedValue(new Error('Network error'));
-
-      const logger = createMockLogger();
-      const config = createTestConfig();
-      const tm = createTokenManager(config, logger);
-
-      await tm.discover();
-      await tm.prefetch();
-
-      expect(logger.info).not.toHaveBeenCalledWith(
-        'Scheduling token prefetch retry',
-        expect.anything(),
+      expect(tm.hasUsableAccessToken()).toBe(true);
+      expect(logger.info).toHaveBeenCalledWith(
+        'Auth readiness: usable access token acquired',
       );
-
       tm.stop();
     });
   });
@@ -376,11 +481,13 @@ describe('TokenManager', () => {
         resource: 'https://mcp.example.com/mcp',
         authorization_servers: ['https://auth.example.com'],
       });
-      mockDiscoverAS.mockResolvedValue({
-        issuer: 'https://auth.example.com',
-        token_endpoint: 'https://auth.example.com/token',
-        grant_types_supported: ['client_credentials'],
-      });
+      mockDiscoverAS.mockResolvedValue(
+        asMetadata({
+          issuer: 'https://auth.example.com',
+          token_endpoint: 'https://auth.example.com/token',
+          grant_types_supported: ['client_credentials'],
+        }),
+      );
 
       const logger = createMockLogger();
       const config = createTestConfig({ scopes: 'custom:scope' });
@@ -414,11 +521,13 @@ describe('TokenManager', () => {
         resource: 'https://mcp.example.com/mcp',
         authorization_servers: ['https://auth.example.com'],
       });
-      mockDiscoverAS.mockResolvedValue({
-        issuer: 'https://auth.example.com',
-        token_endpoint: 'https://auth.example.com/token',
-        grant_types_supported: ['client_credentials'],
-      });
+      mockDiscoverAS.mockResolvedValue(
+        asMetadata({
+          issuer: 'https://auth.example.com',
+          token_endpoint: 'https://auth.example.com/token',
+          grant_types_supported: ['client_credentials'],
+        }),
+      );
 
       const logger = createMockLogger();
       const config = createTestConfig();
@@ -500,7 +609,7 @@ describe('TokenManager', () => {
       await tm.discover();
       await tm.prefetch();
       expect(logger.warn).toHaveBeenCalledWith(
-        expect.stringContaining('Token prefetch failed'),
+        'Token prefetch failed',
         expect.objectContaining({ category: 'authentication', error: 'Network error' }),
       );
     });

@@ -42,34 +42,26 @@ async function main(): Promise<void> {
     clientId: config.clientId,
     refreshSkewSeconds: config.refreshSkewSeconds,
     requestTimeoutMs: config.requestTimeoutMs,
+    startupTimeoutMs: config.startupTimeoutMs,
     capabilitiesPollSeconds: config.capabilitiesPollSeconds,
     debug: config.debug,
   });
 
+  const startupDeadlineMs = Date.now() + config.startupTimeoutMs;
+
   try {
-    await tokenManager.discover();
+    await tokenManager.waitUntilAuthReady(startupDeadlineMs);
   } catch (err) {
-    logger.warn('Initial OAuth discovery failed (will retry on first request)', {
+    logger.error('Startup auth readiness failed', {
       category: 'authentication',
       error: err instanceof Error ? err.message : String(err),
     });
-  }
-
-  const authMode = tokenManager.getAuthMode();
-  if (authMode.type === 'authenticated') {
-    try {
-      await tokenManager.prefetch();
-    } catch (err) {
-      logger.warn('Token prefetch failed (will retry on first request)', {
-        category: 'authentication',
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
+    process.exit(1);
   }
 
   let proxy: ProxyHandle;
   try {
-    proxy = await createProxy(config, tokenManager, logger);
+    proxy = await createProxy(config, tokenManager, logger, startupDeadlineMs);
   } catch (err) {
     logger.error('Failed to start proxy', {
       category: 'connection',
