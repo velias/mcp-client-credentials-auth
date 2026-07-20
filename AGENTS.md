@@ -44,6 +44,7 @@ test/
 - **Transport fallback** -- Streamable HTTP first, SSE only for `connection`-class failures (skip SSE on `authentication` / `remote`; both transports share the same authProvider)
 - **Automatic reconnection** -- detects remote `onclose` or Phase 3 connection failure, reconnects with exponential backoff (1s--60s with jitter), restarts polling; backoff resets after a connection is stable for 30s
 - **OAuth re-discovery** -- if IdP is unreachable at startup, stays in `discovery-failed` mode (rejects requests with error) and retries discovery with exponential backoff (5s--60s); transitions to `authenticated` mode when IdP recovers
+- **Manual token endpoint** -- optional `MCP_CC_PROXY_TOKEN_ENDPOINT` skips MCP Authorization discovery (RFC 9728 / RFC 8414); seeds `ClientCredentialsProvider` with `discoveryState` / `validateResourceURL` so SDK `auth()` hits the configured token URL. Scopes come only from `MCP_CC_PROXY_SCOPES` in this mode. Failed prefetch schedules background retries (same 5s--60s backoff as rediscovery) until the IdP is reachable.
 - **Local disconnect cleanup** -- detects `localServer.onclose` (stdin closed), awaits remote close with 2s timeout, then exits
 - **Timeouts on all outgoing calls** -- `requestTimeoutMs` applied per-request via SDK `{ timeout }` option for MCP calls, and per-call via `AbortSignal.timeout` for OAuth discovery and token acquisition. Transport constructors do NOT receive a signal (a long-lived signal would go stale and break all requests after it fires).
 - **Proactive refresh via `saveTokens` hook** -- monkey-patches `ClientCredentialsProvider.saveTokens` to schedule a timer; this is a deliberate coupling to SDK internals (see upgrade checklist)
@@ -106,6 +107,7 @@ When bumping `@modelcontextprotocol/sdk`, check the following areas where the pr
 - **`auth()` function signature** -- we call `auth(provider, { serverUrl, fetchFn })` directly. If the options shape or return type (`AuthResult`) changes, `prefetch()` and `performRefresh()` break.
 - **`ClientCredentialsProvider.saveTokens`** -- we monkey-patch `saveTokens` to intercept token storage and schedule proactive refresh. If the provider's token lifecycle changes (e.g., refresh handled internally), our hook may become redundant or conflict.
 - **`OAuthTokens.expires_in`** -- our proactive refresh depends on `expires_in` being passed through `saveTokens`. If the SDK starts consuming/removing it before calling `saveTokens`, our timer won't schedule.
+- **`discoveryState` / `saveDiscoveryState` / `validateResourceURL`** -- manual token endpoint mode assigns these optional hooks on `ClientCredentialsProvider` so `auth()` skips rediscovery and omits the RFC 8707 `resource` param. If the SDK changes how cached discovery state is consumed, that path breaks.
 - **Discovery functions** -- `discoverOAuthProtectedResourceMetadata` and `discoverAuthorizationServerMetadata` signatures (especially the `fetchFn` parameter position).
 
 ### Transport layer (`proxy.ts`)

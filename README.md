@@ -4,9 +4,9 @@
 [![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/velias/f550f0ffe68a574a690032088359fef3/raw/mcp-client-credentials-auth-coverage.json)](https://github.com/velias/mcp-client-credentials-auth/actions/workflows/ci.yml)
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/velias/mcp-client-credentials-auth/badge)](https://securityscorecards.dev/viewer/?uri=github.com/velias/mcp-client-credentials-auth)
 
-A local stdio MCP server that authenticates to remote OAuth-protected MCP servers using the **client_credentials** grant, as defined in the [MCP OAuth Client Credentials extension](https://modelcontextprotocol.io/extensions/auth/oauth-client-credentials).
+A local stdio MCP server that authenticates to remote OAuth-protected MCP servers using the **client_credentials** grant, as defined in the [MCP OAuth Client Credentials extension](https://modelcontextprotocol.io/extensions/auth/oauth-client-credentials). Throughout this document, we refer to it as **the auth proxy**.
 
-Drop it into any MCP client configuration and it transparently handles [MCP Authorization](https://modelcontextprotocol.io/specification/2025-11-05/basic/authorization)-based OAuth discovery of the remote MCP Server and its announced Authorization server (IdP), access token acquisition, and MCP request forwarding. Throughout this document, we refer to it as **the auth proxy**.
+Drop it into any MCP client configuration and it transparently handles access token acquisition and MCP request forwarding. By default the token endpoint and scopes are auto-discovered via [MCP Authorization](https://modelcontextprotocol.io/specification/2025-11-05/basic/authorization) and RFC 9728 / RFC 8414. When the remote server accepts Bearer tokens but that discovery is not available, you can supply the IdP token endpoint directly instead (see [Servers without OAuth discovery](#servers-without-oauth-discovery)).
 
 This implements the [client secrets](https://modelcontextprotocol.io/extensions/auth/oauth-client-credentials#client-secrets) variant of the MCP OAuth Client Credentials extension, designed for autonomous AI agents, background services, CI/CD pipelines, server-to-server integrations, and daemon processes that need MCP access without the user in the loop.
 
@@ -15,6 +15,7 @@ To obtain the required `client_id` and `client_secret`, look for a "Service Acco
 ## Features
 
 - **Zero-config OAuth** - token endpoint and scopes auto-discovered via MCP Authorization and RFC 9728 / RFC 8414
+- **Manual token endpoint** - optional override when the remote MCP server accepts Bearer tokens but MCP Authorization discovery (RFC 9728 / RFC 8414) is not available
 - **Transparent forwarding** - all MCP methods forwarded bidirectionally (tools, resources, prompts, sampling, notifications)
 - **Proactive token refresh** - tokens refreshed before expiry using `refreshSkewSeconds` (default 30s) with automatic retries, no MCP request latency spikes
 - **Transport fallback** - Streamable HTTP with automatic SSE fallback for transport failures only (not authentication errors; both transports share the same IdP credentials)
@@ -35,13 +36,12 @@ MCP Client ←→ [stdio] ←→ mcp-client-credentials-auth ←→ [HTTP/SSE + 
 ```
 
 The auth proxy sits between your MCP client and the remote MCP server:
-1. Discovers OAuth metadata from the remote MCP server via RFC 9728 protected resource metadata
-2. Resolves the authorization server (uses the first entry from the `authorization_servers` array in the resource metadata)
-3. Acquires tokens using OAuth `client_credentials` grant
-4. Forwards all MCP requests/responses with `Bearer` authentication
-5. Handles token refresh and 401 retry transparently
+1. Resolves the IdP token endpoint and scopes via MCP Authorization and RFC 9728 / RFC 8414, or uses `MCP_CC_PROXY_TOKEN_ENDPOINT` (and optional `MCP_CC_PROXY_SCOPES`) when that discovery is not available; see [Servers without OAuth discovery](#servers-without-oauth-discovery)
+2. Acquires tokens using OAuth `client_credentials` grant
+3. Forwards all MCP requests/responses with `Bearer` authentication
+4. Handles token refresh and 401 retry transparently
 
-If the IdP is temporarily unavailable at startup, the auth proxy will periodically retry OAuth discovery with exponential backoff (5s to 60s) and begin serving requests as soon as discovery succeeds. If the remote MCP server is unreachable at startup, the auth proxy will still start and accept connections from your MCP client, advertising default capabilities (tools, resources, prompts). It will automatically connect to the remote server when it becomes available.
+If the IdP is temporarily unavailable at startup, the auth proxy will periodically retry with exponential backoff (5s to 60s): OAuth rediscovery in the auto-discovery path, or token prefetch retries when using a manual token endpoint. It begins serving authenticated requests as soon as a token can be acquired. If the remote MCP server is unreachable at startup, the auth proxy will still start and accept connections from your MCP client, advertising default capabilities (tools, resources, prompts). It will automatically connect to the remote server when it becomes available.
 
 ## Quick Start
 
@@ -61,7 +61,7 @@ If the IdP is temporarily unavailable at startup, the auth proxy will periodical
 }
 ```
 
-That's it. Token endpoint, auth method, and scopes are all auto-discovered.
+That's it. Token endpoint, auth method, and scopes are auto-discovered via MCP Authorization and RFC 9728 / RFC 8414. If that discovery is not available, set `MCP_CC_PROXY_TOKEN_ENDPOINT` (and usually `MCP_CC_PROXY_SCOPES`); see [Servers without OAuth discovery](#servers-without-oauth-discovery).
 
 **Security note:** `npx` command downloads npm package and runs it on your local machine. Use it with trusted packages only!
 
@@ -74,11 +74,48 @@ All configuration via `MCP_CC_PROXY_*` environment variables:
 | `MCP_CC_PROXY_REMOTE_MCP_URL` | Yes | — | Remote MCP server URL (`http://` or `https://`) |
 | `MCP_CC_PROXY_CLIENT_ID` | Yes | — | OAuth client_id |
 | `MCP_CC_PROXY_CLIENT_SECRET` | Yes | — | OAuth client_secret |
-| `MCP_CC_PROXY_SCOPES` | No | auto-discovered | Override OAuth scopes sent in the token request (space-separated). When set, discovered `scopes_supported` is ignored. See [Notes for MCP Server Developers](#notes-for-mcp-server-developers). |
+| `MCP_CC_PROXY_TOKEN_ENDPOINT` | No | — | IdP token endpoint URL (`http://` or `https://`). When set, skips MCP Authorization discovery (RFC 9728 / RFC 8414) and requests tokens directly from this URL. Use `https://` in production; cleartext HTTP to a non-loopback host logs a warning because the client secret would travel unencrypted. See [Servers without OAuth discovery](#servers-without-oauth-discovery). |
+| `MCP_CC_PROXY_SCOPES` | No | auto-discovered | OAuth scopes sent in the token request (space-separated). When set, `scopes_supported` from MCP Authorization / RFC 9728 discovery is ignored. With a manual token endpoint that discovery is skipped, so set this if your MCP Server requires scopes. See [Notes for MCP Server Developers](#notes-for-mcp-server-developers). |
 | `MCP_CC_PROXY_DEBUG` | No | `false` | Enable debug logging to stderr |
 | `MCP_CC_PROXY_REFRESH_SKEW_SECONDS` | No | `30` | Proactive token refresh window (seconds before token expiry) |
 | `MCP_CC_PROXY_REQUEST_TIMEOUT_MS` | No | `30000` | Timeout for all outgoing network calls: MCP requests, OAuth discovery, and token acquisition (ms) |
 | `MCP_CC_PROXY_CAPABILITIES_POLL_SECONDS` | No | `60` | Interval to poll remote MCP server for capability changes (0 = disabled) |
+
+### Servers without OAuth discovery
+
+Use this when the remote MCP server accepts `Bearer` tokens but MCP Authorization discovery (RFC 9728 / RFC 8414) is not available. The proxy still uses the OAuth `client_credentials` grant; instead of discovering the token endpoint and scopes, you configure them from values provided by the MCP server provider (their setup docs, developer portal, or support). Do not invent these values; the provider knows the correct IdP token endpoint URL and which scopes your credentials need.
+
+**Required:** `MCP_CC_PROXY_REMOTE_MCP_URL`, `MCP_CC_PROXY_CLIENT_ID`, `MCP_CC_PROXY_CLIENT_SECRET`, `MCP_CC_PROXY_TOKEN_ENDPOINT`.
+
+**Usually also:** `MCP_CC_PROXY_SCOPES` (there is no discovered `scopes_supported` in this mode; use the scopes your provider documents).
+
+Prefer `https://` for `MCP_CC_PROXY_TOKEN_ENDPOINT`; cleartext HTTP to a non-loopback host logs a warning because the client secret would travel unencrypted.
+
+```jsonc
+{
+  "mcpServers": {
+    "my-remote-server": {
+      "command": "npx",
+      "args": ["-y", "mcp-client-credentials-auth"],
+      "env": {
+        "MCP_CC_PROXY_REMOTE_MCP_URL": "https://mcp.example.com/mcp",
+        "MCP_CC_PROXY_CLIENT_ID": "my-service",
+        "MCP_CC_PROXY_CLIENT_SECRET": "s3cr3t",
+        "MCP_CC_PROXY_TOKEN_ENDPOINT": "https://auth.example.com/oauth/token",
+        "MCP_CC_PROXY_SCOPES": "inventory.read orders.write"
+      }
+    }
+  }
+}
+```
+
+What changes versus auto-discovery via MCP Authorization and RFC 9728 / RFC 8414:
+
+- Skips that discovery and uses your configured token endpoint instead
+- Still acquires tokens with `client_credentials`, attaches `Bearer` on MCP requests, and runs proactive refresh
+- If the IdP is down at startup, the proxy still starts and retries token acquisition in the background (5s to 60s backoff) until it succeeds
+
+Prefer auto-discovery via MCP Authorization and RFC 9728 / RFC 8414 when it is available. If you set `MCP_CC_PROXY_TOKEN_ENDPOINT`, the manual path is used even when discovery would have worked.
 
 ## Security
 
@@ -196,7 +233,7 @@ If the proxy acquires a token but the remote server rejects requests, the token 
 
 **Debugging steps:**
 
-1. Look for the `OAuth discovery complete` log line (always printed at startup), its `scopes` field shows the `scopes_supported` values discovered from the remote server's resource metadata, or `(default)` if none were advertised.
+1. Look for the startup scopes log: `OAuth discovery complete` (auto-discovery) or `Using manual token endpoint (skipping OAuth discovery)` (manual token endpoint). The `scopes` field shows what will be requested, or `(default)` / `(none)` if none were set.
 2. Request a token directly from your IdP's token endpoint (using `curl` or your IdP's admin UI), decode it at [jwt.io](https://jwt.io) or with `jq`, and inspect the `scope` or `scp` claim to see what was actually granted.
 3. Compare with the scopes the remote MCP server requires for the failing operation.
 4. If scopes are missing, update the scope grants on your service account in the IdP, or contact the MCP server operator.
@@ -213,7 +250,7 @@ List **granular, application-level scopes** in `scopes_supported`. These serve t
 {
   "resource": "https://mcp.example.com/mcp",
   "authorization_servers": ["https://auth.example.com"],
-  "scopes_supported": ["mcp:tools", "mcp:resources", "mcp:prompts"]
+  "scopes_supported": ["inventory.read", "orders.write", "orders.read"]
 }
 ```
 

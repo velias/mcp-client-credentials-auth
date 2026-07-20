@@ -125,4 +125,36 @@ describe('Config', () => {
     expect(config.scopes).toBeUndefined();
   });
 
+  it('parses MCP_CC_PROXY_TOKEN_ENDPOINT into config.tokenEndpoint', () => {
+    setRequiredEnv();
+    process.env.MCP_CC_PROXY_TOKEN_ENDPOINT = 'https://auth.example.com/oauth/token';
+    const config = loadConfig();
+    expect(config.tokenEndpoint).toBe('https://auth.example.com/oauth/token');
+  });
+
+  it('leaves tokenEndpoint undefined when MCP_CC_PROXY_TOKEN_ENDPOINT is not set', () => {
+    setRequiredEnv();
+    const config = loadConfig();
+    expect(config.tokenEndpoint).toBeUndefined();
+  });
+
+  it('treats empty MCP_CC_PROXY_TOKEN_ENDPOINT as undefined', () => {
+    setRequiredEnv();
+    process.env.MCP_CC_PROXY_TOKEN_ENDPOINT = '';
+    const config = loadConfig();
+    expect(config.tokenEndpoint).toBeUndefined();
+  });
+
+  it('rejects invalid MCP_CC_PROXY_TOKEN_ENDPOINT URL', () => {
+    setRequiredEnv();
+    process.env.MCP_CC_PROXY_TOKEN_ENDPOINT = 'not-a-url';
+    expect(() => loadConfig()).toThrow('Invalid configuration');
+  });
+
+  it('rejects non-http MCP_CC_PROXY_TOKEN_ENDPOINT scheme', () => {
+    setRequiredEnv();
+    process.env.MCP_CC_PROXY_TOKEN_ENDPOINT = 'ftp://auth.example.com/token';
+    expect(() => loadConfig()).toThrow('Invalid configuration');
+  });
+
 });

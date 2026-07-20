@@ -6,6 +6,7 @@ import {
   discoverOAuthProtectedResourceMetadata,
   discoverAuthorizationServerMetadata,
   type OAuthClientProvider,
+  type OAuthDiscoveryState,
 } from '@modelcontextprotocol/sdk/client/auth.js';
 import type {
   OAuthProtectedResourceMetadata,
@@ -31,6 +32,44 @@ export interface TokenManager {
   stop(): void;
 }
 
+const REDISCOVERY_BASE_MS = 5000;
+const REDISCOVERY_MAX_MS = 60000;
+
+function getBackoffDelay(attempt: number, baseMs: number, maxMs: number): number {
+  const exponential = Math.min(baseMs * 2 ** attempt, maxMs);
+  const jitter = Math.random() * exponential * 0.3;
+  return Math.round(exponential + jitter);
+}
+
+function seedManualDiscoveryState(
+  provider: ClientCredentialsProvider,
+  tokenEndpoint: string,
+  remoteMcpUrl: string,
+): void {
+  const issuer = new URL(tokenEndpoint).origin;
+  let discoveryState: OAuthDiscoveryState = {
+    authorizationServerUrl: issuer,
+    authorizationServerMetadata: {
+      issuer,
+      authorization_endpoint: tokenEndpoint,
+      token_endpoint: tokenEndpoint,
+      response_types_supported: [],
+      grant_types_supported: ['client_credentials'],
+      token_endpoint_auth_methods_supported: ['client_secret_basic'],
+    },
+    resourceMetadata: { resource: remoteMcpUrl },
+  };
+
+  // ClientCredentialsProvider does not declare these optional OAuthClientProvider hooks;
+  // assign them so auth() skips RFC 9728 / AS rediscovery and omits the resource param.
+  const extensible = provider as ClientCredentialsProvider & OAuthClientProvider;
+  extensible.discoveryState = () => discoveryState;
+  extensible.saveDiscoveryState = (state: OAuthDiscoveryState) => {
+    discoveryState = state;
+  };
+  extensible.validateResourceURL = () => Promise.resolve(undefined);
+}
+
 export function createTokenManager(config: Config, logger: Logger): TokenManager {
   let authMode: AuthMode = {
     type: 'discovery-failed',
@@ -44,9 +83,8 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
   let inflightRefresh: Promise<void> | undefined;
   let rediscoveryTimer: ReturnType<typeof setTimeout> | undefined;
   let rediscoveryAttempt = 0;
-
-  const REDISCOVERY_BASE_MS = 5000;
-  const REDISCOVERY_MAX_MS = 60000;
+  let prefetchRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  let prefetchRetryAttempt = 0;
 
   const timeoutFetch: typeof globalThis.fetch = (input, init) => {
     const signal = config.requestTimeoutMs
@@ -55,15 +93,31 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
     return fetch(input, { ...init, signal });
   };
 
-  function getRediscoveryDelay(): number {
-    const exponential = Math.min(REDISCOVERY_BASE_MS * 2 ** rediscoveryAttempt, REDISCOVERY_MAX_MS);
-    const jitter = Math.random() * exponential * 0.3;
-    return Math.round(exponential + jitter);
+  function clearPrefetchRetry(): void {
+    if (prefetchRetryTimer) {
+      clearTimeout(prefetchRetryTimer);
+      prefetchRetryTimer = undefined;
+    }
+    prefetchRetryAttempt = 0;
+  }
+
+  function schedulePrefetchRetry(): void {
+    if (prefetchRetryTimer || !config.tokenEndpoint) return;
+    const delayMs = getBackoffDelay(prefetchRetryAttempt, REDISCOVERY_BASE_MS, REDISCOVERY_MAX_MS);
+    logger.info('Scheduling token prefetch retry', {
+      attempt: prefetchRetryAttempt + 1,
+      delayMs,
+    });
+    prefetchRetryTimer = setTimeout(() => {
+      prefetchRetryTimer = undefined;
+      prefetchRetryAttempt++;
+      void prefetch();
+    }, delayMs);
   }
 
   function scheduleRediscovery(): void {
     if (rediscoveryTimer) return;
-    const delayMs = getRediscoveryDelay();
+    const delayMs = getBackoffDelay(rediscoveryAttempt, REDISCOVERY_BASE_MS, REDISCOVERY_MAX_MS);
     logger.info('Scheduling OAuth re-discovery', {
       attempt: rediscoveryAttempt + 1,
       delayMs,
@@ -95,7 +149,43 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
     }
   }
 
+  function createAuthenticatedProvider(scopes: string | undefined): ClientCredentialsProvider {
+    const p = new ClientCredentialsProvider({
+      clientId: config.clientId,
+      clientSecret: config.clientSecret,
+      ...(scopes ? { scope: scopes } : {}),
+    });
+    installRefreshHook(p);
+    return p;
+  }
+
+  function setupManualTokenEndpoint(): void {
+    const tokenEndpoint = config.tokenEndpoint!;
+    if (config.scopes) {
+      currentScopes = config.scopes;
+      logger.info('Using scopes from MCP_CC_PROXY_SCOPES', {
+        scopes: currentScopes,
+      });
+    } else {
+      currentScopes = undefined;
+    }
+
+    provider = createAuthenticatedProvider(currentScopes);
+    seedManualDiscoveryState(provider, tokenEndpoint, config.remoteMcpUrl);
+
+    authMode = { type: 'authenticated', provider };
+    logger.info('Using manual token endpoint (skipping OAuth discovery)', {
+      tokenEndpoint,
+      scopes: currentScopes ?? '(none)',
+    });
+  }
+
   async function discover(): Promise<void> {
+    if (config.tokenEndpoint) {
+      setupManualTokenEndpoint();
+      return;
+    }
+
     const serverUrl = config.remoteMcpUrl;
     logger.info('Starting OAuth discovery', { serverUrl });
 
@@ -162,13 +252,7 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
       currentScopes = resourceMetadata.scopes_supported.join(' ');
     }
 
-    provider = new ClientCredentialsProvider({
-      clientId: config.clientId,
-      clientSecret: config.clientSecret,
-      ...(currentScopes ? { scope: currentScopes } : {}),
-    });
-
-    installRefreshHook(provider);
+    provider = createAuthenticatedProvider(currentScopes);
 
     authMode = { type: 'authenticated', provider };
     rediscoveryAttempt = 0;
@@ -269,6 +353,7 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
       const result = await auth(provider, { serverUrl: config.remoteMcpUrl, fetchFn: timeoutFetch });
       if (result === 'AUTHORIZED') {
         logger.info('Token prefetch successful');
+        clearPrefetchRetry();
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -276,6 +361,9 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
         category: 'authentication',
         error: message,
       });
+      if (config.tokenEndpoint) {
+        schedulePrefetchRetry();
+      }
     }
   }
 
@@ -288,6 +376,7 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
       clearTimeout(rediscoveryTimer);
       rediscoveryTimer = undefined;
     }
+    clearPrefetchRetry();
     if (provider) {
       provider.saveTokens({ access_token: '', token_type: 'bearer' });
     }
@@ -302,6 +391,7 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
       clearTimeout(rediscoveryTimer);
       rediscoveryTimer = undefined;
     }
+    clearPrefetchRetry();
   }
 
   function getAuthProvider(): OAuthClientProvider | undefined {
