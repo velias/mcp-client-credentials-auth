@@ -17,7 +17,7 @@ To obtain the required `client_id` and `client_secret`, look for a "Service Acco
 - **Zero-config OAuth** - token endpoint and scopes auto-discovered via MCP Authorization and RFC 9728 / RFC 8414
 - **Transparent forwarding** - all MCP methods forwarded bidirectionally (tools, resources, prompts, sampling, notifications)
 - **Proactive token refresh** - tokens refreshed before expiry using `refreshSkewSeconds` (default 30s) with automatic retries, no MCP request latency spikes
-- **Transport fallback** - Streamable HTTP with automatic SSE fallback
+- **Transport fallback** - Streamable HTTP with automatic SSE fallback for transport failures only (not authentication errors; both transports share the same IdP credentials)
 - **Resilient startup** - starts even when the remote MCP server or IdP is unavailable, connecting automatically when they become reachable
 - **Automatic reconnection** - detects remote server disconnects and reconnects with exponential backoff, preserving client identity and capabilities
 - **Live change detection** - polls the remote server for capability changes (tools, resources, prompts) and notifies your MCP client automatically
@@ -175,6 +175,16 @@ All auth proxy logs are written to **stderr** (stdout is reserved for MCP protoc
 - **Claude Code** - logs appear in the terminal with `--mcp-debug` flag
 
 Set `MCP_CC_PROXY_DEBUG=true` for verbose output including OAuth discovery details, message forwarding, and token refresh scheduling.
+
+Every runtime failure is labeled with the same three categories in both JSON-RPC errors and stderr (`category=`), always prefixed with `mcp-client-credentials-auth`:
+
+| Category | Meaning | Example |
+|----------|---------|---------|
+| `authentication` | Token/IdP failure (scopes, client secret, OAuth discovery) | `mcp-client-credentials-auth [authentication]: Invalid scopes: api.graphql` |
+| `connection` | Proxy cannot reach or stay connected to the remote MCP transport | `mcp-client-credentials-auth [connection]: temporarily unavailable (reconnecting)` |
+| `remote` | Remote MCP server returned a protocol/application error (including resource-server 401/403) | `mcp-client-credentials-auth [remote]: …` |
+
+Stderr lines also include `component=mcp-client-credentials-auth` so they remain attributable inside generic MCP client log panels.
 
 ### Token acquired but remote server returns 403
 

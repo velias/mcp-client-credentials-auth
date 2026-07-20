@@ -1,3 +1,5 @@
+import { PROXY_NAME } from './errors.js';
+
 export interface Logger {
   info(msg: string, meta?: Record<string, unknown>): void;
   warn(msg: string, meta?: Record<string, unknown>): void;
@@ -47,7 +49,12 @@ export function createLogger(debug?: boolean): Logger {
     meta?: Record<string, unknown>,
   ): void {
     const timestamp = new Date().toISOString();
-    const parts = [`ts=${timestamp}`, `level=${level}`, `msg=${msg}`];
+    const parts = [
+      `ts=${timestamp}`,
+      `level=${level}`,
+      `component=${PROXY_NAME}`,
+      `msg=${msg}`,
+    ];
     if (meta && Object.keys(meta).length > 0) {
       parts.push(formatMeta(meta));
     }

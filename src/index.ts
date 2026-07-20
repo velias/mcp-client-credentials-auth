@@ -41,6 +41,7 @@ async function main(): Promise<void> {
     await tokenManager.discover();
   } catch (err) {
     logger.warn('Initial OAuth discovery failed (will retry on first request)', {
+      category: 'authentication',
       error: err instanceof Error ? err.message : String(err),
     });
   }
@@ -51,6 +52,7 @@ async function main(): Promise<void> {
       await tokenManager.prefetch();
     } catch (err) {
       logger.warn('Token prefetch failed (will retry on first request)', {
+        category: 'authentication',
         error: err instanceof Error ? err.message : String(err),
       });
     }
@@ -61,6 +63,7 @@ async function main(): Promise<void> {
     proxy = await createProxy(config, tokenManager, logger);
   } catch (err) {
     logger.error('Failed to start proxy', {
+      category: 'connection',
       error: err instanceof Error ? err.message : String(err),
     });
     process.exit(1);
@@ -79,7 +82,7 @@ async function main(): Promise<void> {
 
 main().catch((err) => {
   process.stderr.write(
-    `Fatal: ${err instanceof Error ? err.message : String(err)}\n`,
+    `Fatal: mcp-client-credentials-auth: ${err instanceof Error ? err.message : String(err)}\n`,
   );
   process.exit(1);
 });

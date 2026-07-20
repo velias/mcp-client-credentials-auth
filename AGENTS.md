@@ -19,11 +19,13 @@
 src/
   index.ts             # Entry point: config, connect, start, shutdown
   config.ts            # MCP_CC_PROXY_* env var loading, zod validation
+  errors.ts            # Proxy error categories, formatting, client-facing McpError wrap
   logger.ts            # Structured stderr logger (key=value, no deps)
   token-manager.ts     # OAuth discovery, client_credentials, cache, refresh
   proxy.ts             # Wire local Server <-> remote Client
 test/
   config.test.ts           # Config parsing, validation, defaults, scope override
+  errors.test.ts           # Error classification and mcp-client-credentials-auth [category] format
   token-manager.test.ts    # Discovery, auth modes, scope resolution, prefetch, proactive refresh
   proxy.test.ts            # E2E with in-memory MCP transports, reconnection
   proxy-advanced.test.ts   # Auth mode error handling (unsupported-grant, discovery-failed)
@@ -39,7 +41,7 @@ test/
 - **Protocol-version agnostic** -- uses SDK fallback handlers for bidirectional pass-through
 - **No hardcoded method tables** -- all 4 message flows use `fallbackRequestHandler`/`fallbackNotificationHandler`
 - **`_meta` sanitization** -- auth-like keys stripped from all client-to-server messages (requests and notifications) before forwarding to remote
-- **Transport fallback** -- Streamable HTTP first, SSE if that fails
+- **Transport fallback** -- Streamable HTTP first, SSE only for `connection`-class failures (skip SSE on `authentication` / `remote`; both transports share the same authProvider)
 - **Automatic reconnection** -- detects remote `onclose` or Phase 3 connection failure, reconnects with exponential backoff (1s--60s with jitter), restarts polling; backoff resets after a connection is stable for 30s
 - **OAuth re-discovery** -- if IdP is unreachable at startup, stays in `discovery-failed` mode (rejects requests with error) and retries discovery with exponential backoff (5s--60s); transitions to `authenticated` mode when IdP recovers
 - **Local disconnect cleanup** -- detects `localServer.onclose` (stdin closed), awaits remote close with 2s timeout, then exits
@@ -83,6 +85,8 @@ All logging goes to stderr via `logger.ts`. stdout is reserved for JSON-RPC.
 - **Actionable context in warnings/errors**: include what will happen next ("will retry on first request", "scheduling retry", "proxy will stop").
 - **Never log secrets**: the logger redacts values for keys matching secret patterns (token, secret, authorization, etc.). Do not pass raw tokens as the `msg` argument; put them in the `meta` object where redaction applies.
 - **Structured metadata**: pass context as the second argument `meta` object, not interpolated into the message string. This keeps logs parseable.
+- **Component field**: every log line includes `component=mcp-client-credentials-auth` (from `logger.ts`).
+- **Failure categories**: runtime failures use exactly three categories via `errors.ts` -- `authentication` (IdP/token), `connection` (transport), `remote` (remote MCP response). Client-facing messages are `mcp-client-credentials-auth [<category>]: <detail>`; matching failure logs must include `category=<same>` in meta.
 
 ## Testing Conventions
 

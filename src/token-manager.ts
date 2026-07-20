@@ -13,6 +13,7 @@ import type {
   AuthorizationServerMetadata,
 } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { Config } from './config.js';
+import { formatProxyError } from './errors.js';
 import type { Logger } from './logger.js';
 
 export type AuthMode =
@@ -31,7 +32,10 @@ export interface TokenManager {
 }
 
 export function createTokenManager(config: Config, logger: Logger): TokenManager {
-  let authMode: AuthMode = { type: 'discovery-failed', message: 'Discovery not attempted yet' };
+  let authMode: AuthMode = {
+    type: 'discovery-failed',
+    message: formatProxyError('authentication', 'Discovery not attempted yet'),
+  };
   let provider: ClientCredentialsProvider | undefined;
   let currentScopes: string | undefined;
   let resourceMetadata: OAuthProtectedResourceMetadata | undefined;
@@ -81,6 +85,7 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
       }
     } catch (err) {
       logger.warn('OAuth re-discovery failed', {
+        category: 'authentication',
         error: err instanceof Error ? err.message : String(err),
         attempt: rediscoveryAttempt,
       });
@@ -120,8 +125,10 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
 
     if (!authServerMetadata) {
       if (resourceDiscoveryFailed && asDiscoveryFailed) {
-        const msg = 'OAuth discovery failed (both resource and authorization server endpoints unreachable). Requests will be rejected until discovery succeeds.';
-        logger.warn(msg);
+        const detail =
+          'OAuth discovery failed (both resource and authorization server endpoints unreachable). Requests will be rejected until discovery succeeds.';
+        const msg = formatProxyError('authentication', detail);
+        logger.warn(msg, { category: 'authentication' });
         authMode = { type: 'discovery-failed', message: msg };
         scheduleRediscovery();
         return;
@@ -137,8 +144,11 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
 
     const grantTypes = authServerMetadata.grant_types_supported ?? ['authorization_code'];
     if (!grantTypes.includes('client_credentials')) {
-      const msg = `Remote MCP server requires authentication but its IdP does not support client_credentials grant. Supported grants: [${grantTypes.join(', ')}]. This proxy only supports client_credentials.`;
-      logger.error(msg);
+      const detail =
+        `Remote MCP server requires authentication but its IdP does not support client_credentials grant. ` +
+        `Supported grants: [${grantTypes.join(', ')}]. This proxy only supports client_credentials.`;
+      const msg = formatProxyError('authentication', detail);
+      logger.error(msg, { category: 'authentication' });
       authMode = { type: 'unsupported-grant', message: msg };
       return;
     }
@@ -229,6 +239,7 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
       if (refreshRetryCount < MAX_REFRESH_RETRIES) {
         const retryMs = getRetryIntervalMs();
         logger.warn('Proactive token refresh failed, scheduling retry', {
+          category: 'authentication',
           error: err instanceof Error ? err.message : String(err),
           attempt: refreshRetryCount,
           maxAttempts: MAX_REFRESH_RETRIES,
@@ -238,6 +249,7 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
       } else {
         const extendedDelayMs = getExtendedRetryDelay();
         logger.warn('Proactive token refresh exhausted fast retries, switching to extended backoff', {
+          category: 'authentication',
           error: err instanceof Error ? err.message : String(err),
           attempts: refreshRetryCount,
           nextRetryMs: extendedDelayMs,
@@ -261,6 +273,7 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       logger.warn('Token prefetch failed (will retry on first request)', {
+        category: 'authentication',
         error: message,
       });
     }
