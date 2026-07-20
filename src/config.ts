@@ -17,6 +17,7 @@ export const ConfigSchema = z.object({
   clientSecret: z.string().min(1),
   refreshSkewSeconds: z.number().int().positive().default(30),
   requestTimeoutMs: z.number().int().positive().default(30000),
+  startupTimeoutMs: z.number().int().positive().default(60000),
   capabilitiesPollSeconds: z.number().int().min(0).default(60),
   scopes: z.string().optional(),
   tokenEndpoint: httpOrHttpsUrl.optional(),
@@ -45,6 +46,7 @@ export function loadConfig(): Config {
       process.env.MCP_CC_PROXY_REFRESH_SKEW_SECONDS,
     ),
     requestTimeoutMs: parseNumber(process.env.MCP_CC_PROXY_REQUEST_TIMEOUT_MS),
+    startupTimeoutMs: parseNumber(process.env.MCP_CC_PROXY_STARTUP_TIMEOUT_MS),
     capabilitiesPollSeconds: parseNumber(
       process.env.MCP_CC_PROXY_CAPABILITIES_POLL_SECONDS,
     ),

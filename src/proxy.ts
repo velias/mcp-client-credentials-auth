@@ -12,6 +12,8 @@ import {
   PROXY_NAME,
   classifyError,
   errorDetail,
+  formatUnrecoverableOAuthMisconfig,
+  resolveUnrecoverableStartupAuthSource,
   toClientError,
   wrapCaughtError,
 } from './errors.js';
@@ -79,19 +81,32 @@ export interface ProxyHandle {
   close(): Promise<void>;
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
 export async function createProxy(
   config: Config,
   tokenManager: TokenManager,
   logger: Logger,
+  /** Absolute deadline (Date.now()-based) for Phase 1 remote readiness; defaults to now + startupTimeoutMs. */
+  startupDeadlineMs: number = Date.now() + config.startupTimeoutMs,
 ): Promise<ProxyHandle> {
   const remoteUrl = new URL(config.remoteMcpUrl);
 
-  // --- Phase 1: Discovery connection (best-effort) ---
+  // --- Phase 1: Required discovery connection (retry until shared startup deadline) ---
   let discoveredCapabilities: ServerCapabilities = {};
   let remoteServerInfo: Implementation | undefined;
 
-  logger.info('Connecting to remote MCP server for discovery', { url: config.remoteMcpUrl });
-  try {
+  const PHASE1_RETRY_BASE_MS = 1000;
+  const PHASE1_RETRY_MAX_MS = 60000;
+
+  async function connectDiscoveryClient(): Promise<{
+    capabilities: ServerCapabilities;
+    serverInfo: Implementation | undefined;
+  }> {
     const authProvider = tokenManager.getAuthProvider();
     const discoveryClient = new Client(
       { name: PROXY_NAME, version: PKG_VERSION },
@@ -125,19 +140,58 @@ export async function createProxy(
       logger.info('Discovery: connected to remote MCP server via SSE');
     }
 
-    discoveredCapabilities = discoveryClient.getServerCapabilities() ?? {};
-    remoteServerInfo = discoveryClient.getServerVersion();
+    const capabilities = discoveryClient.getServerCapabilities() ?? {};
+    const serverInfo = discoveryClient.getServerVersion();
     await discoveryClient.close();
     logger.debug('Discovery connection closed');
-  } catch (err) {
-    const detail = errorDetail(err);
-    const category = classifyError(err);
-    logger.warn(
-      'Remote MCP server unreachable during discovery; starting with default capabilities. ' +
-      'Will attempt connection when local client connects.',
-      { category, error: detail },
-    );
-    discoveredCapabilities = { tools: {}, resources: {}, prompts: {} };
+    return { capabilities, serverInfo };
+  }
+
+  let phase1Attempt = 0;
+  while (true) {
+    logger.info('Connecting to remote MCP server for discovery', {
+      url: config.remoteMcpUrl,
+      attempt: phase1Attempt + 1,
+    });
+    try {
+      const result = await connectDiscoveryClient();
+      discoveredCapabilities = result.capabilities;
+      remoteServerInfo = result.serverInfo;
+      break;
+    } catch (err) {
+      const detail = errorDetail(err);
+      const category = classifyError(err);
+      const authFailureSource = resolveUnrecoverableStartupAuthSource(err);
+      if (authFailureSource) {
+        const message = formatUnrecoverableOAuthMisconfig(detail, authFailureSource);
+        logger.error(message, {
+          category: 'authentication',
+          unrecoverable: true,
+          failureSource: authFailureSource,
+          error: detail,
+        });
+        throw new Error(message, { cause: err });
+      }
+      const remaining = startupDeadlineMs - Date.now();
+      if (remaining <= 0) {
+        throw new Error(
+          `Remote MCP server unreachable within startup timeout: ${detail}`,
+          { cause: err },
+        );
+      }
+      const exponential = Math.min(PHASE1_RETRY_BASE_MS * 2 ** phase1Attempt, PHASE1_RETRY_MAX_MS);
+      const jitter = Math.random() * exponential * 0.3;
+      const delayMs = Math.min(Math.round(exponential + jitter), remaining);
+      logger.warn('Remote MCP server unreachable during discovery, retrying', {
+        category,
+        error: detail,
+        attempt: phase1Attempt + 1,
+        delayMs,
+        remainingMs: remaining,
+      });
+      await sleep(delayMs);
+      phase1Attempt++;
+    }
   }
 
   // --- Phase 2: Create local server with discovered info ---
@@ -371,11 +425,12 @@ export async function createProxy(
     await readyPromise;
 
     const authMode = tokenManager.getAuthMode();
-    if (authMode.type === 'unsupported-grant') {
-      throw toClientError('authentication', authMode.message);
-    }
-    if (authMode.type === 'discovery-failed') {
-      throw toClientError('authentication', authMode.message);
+    if (authMode.type === 'authenticated' && !tokenManager.hasUsableAccessToken()) {
+      logger.warn('Rejecting request: no usable access token', {
+        category: 'authentication',
+        method: request.method,
+      });
+      throw toClientError('authentication', 'no usable access token');
     }
 
     if (!remoteClient) {

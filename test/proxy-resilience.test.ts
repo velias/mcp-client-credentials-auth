@@ -94,6 +94,7 @@ function createMockConfig(overrides?: Partial<Config>): Config {
     clientSecret: 'test-secret',
     refreshSkewSeconds: 30,
     requestTimeoutMs: 30000,
+    startupTimeoutMs: 60000,
     capabilitiesPollSeconds: 0,
     debug: false,
     ...overrides,
@@ -114,6 +115,8 @@ function createMockTokenManager(mode: AuthMode = { type: 'authenticated', provid
   return {
     discover: vi.fn(),
     prefetch: vi.fn(),
+    waitUntilAuthReady: vi.fn().mockResolvedValue(undefined),
+    hasUsableAccessToken: vi.fn().mockReturnValue(mode.type === 'authenticated'),
     getAuthProvider: vi.fn().mockReturnValue(mode.type === 'authenticated' ? {} : undefined),
     getAuthMode: vi.fn().mockReturnValue(mode),
     invalidate: vi.fn(),
@@ -149,7 +152,11 @@ describe('Proxy resilience', () => {
       const tokenManager = createMockTokenManager();
 
       const { createProxy } = await import('../src/proxy.js');
-      proxyHandle = await createProxy(config, tokenManager, logger);
+      await expect(
+        createProxy(config, tokenManager, logger, Date.now() + 60_000),
+      ).rejects.toThrow(
+        /Unrecoverable OAuth misconfiguration at the identity provider \(IdP\): Invalid scopes: api\.graphql/,
+      );
 
       expect(logger.warn).toHaveBeenCalledWith(
         'Streamable HTTP connection failed, not trying SSE fallback',
@@ -158,32 +165,80 @@ describe('Proxy resilience', () => {
           error: 'Invalid scopes: api.graphql',
         }),
       );
-      expect(sseTransportCallCount).toBe(0);
-
-      endClient = new Client(
-        { name: 'test-client', version: '2.5.0' },
-        { capabilities: { sampling: {} } },
-      );
-      await endClient.connect(localTransportPair[0]);
-      await new Promise((r) => setTimeout(r, 80));
-
-      expect(logger.warn).toHaveBeenCalledWith(
-        'Streamable HTTP failed, not trying SSE fallback',
-        expect.objectContaining({
-          category: 'authentication',
-          error: 'Invalid scopes: api.graphql',
-        }),
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.stringContaining('at the identity provider (IdP)'),
+        expect.objectContaining({ unrecoverable: true, failureSource: 'idp' }),
       );
       expect(sseTransportCallCount).toBe(0);
+      expect(logger.warn).not.toHaveBeenCalledWith(
+        'Remote MCP server unreachable during discovery, retrying',
+        expect.anything(),
+      );
     });
   });
 
   describe('Phase 1 discovery failure', () => {
-    it('starts with default capabilities when remote is unreachable', async () => {
+    it('fails immediately when the remote MCP server rejects the access token', async () => {
+      const { UnauthorizedError } = await import('@modelcontextprotocol/sdk/client/auth.js');
+      transportCallCount = 0;
+      sseTransportCallCount = 0;
+      upstreamServers.length = 0;
+
+      streamableHttpThrow = () => new UnauthorizedError('Unauthorized');
+
+      const config = createMockConfig();
+      const logger = createMockLogger();
+      const tokenManager = createMockTokenManager();
+
+      const { createProxy } = await import('../src/proxy.js');
+      await expect(
+        createProxy(config, tokenManager, logger, Date.now() + 60_000),
+      ).rejects.toThrow(
+        /Unrecoverable OAuth misconfiguration at the remote MCP server: Unauthorized/,
+      );
+
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.stringContaining('at the remote MCP server'),
+        expect.objectContaining({
+          category: 'authentication',
+          unrecoverable: true,
+          failureSource: 'mcp-server',
+          error: 'Unauthorized',
+        }),
+      );
+      expect(sseTransportCallCount).toBe(0);
+      expect(logger.warn).not.toHaveBeenCalledWith(
+        'Remote MCP server unreachable during discovery, retrying',
+        expect.anything(),
+      );
+    });
+
+    it('fails startup when remote stays unreachable within the deadline', async () => {
       transportCallCount = 0;
       upstreamServers.length = 0;
 
-      // Fail calls 1-2 (Phase 1: HTTP + SSE discovery), succeed after
+      transportShouldFail = () => true;
+
+      const config = createMockConfig();
+      const logger = createMockLogger();
+      const tokenManager = createMockTokenManager();
+
+      const { createProxy } = await import('../src/proxy.js');
+      await expect(
+        createProxy(config, tokenManager, logger, Date.now() + 80),
+      ).rejects.toThrow(/Remote MCP server unreachable within startup timeout/);
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        'Remote MCP server unreachable during discovery, retrying',
+        expect.any(Object),
+      );
+    });
+
+    it('retries Phase 1 and starts when remote becomes reachable before the deadline', async () => {
+      transportCallCount = 0;
+      upstreamServers.length = 0;
+
+      // Fail first Phase 1 attempt (HTTP + SSE), succeed on retry
       transportShouldFail = (i) => i <= 2;
 
       const config = createMockConfig();
@@ -191,10 +246,10 @@ describe('Proxy resilience', () => {
       const tokenManager = createMockTokenManager();
 
       const { createProxy } = await import('../src/proxy.js');
-      proxyHandle = await createProxy(config, tokenManager, logger);
+      proxyHandle = await createProxy(config, tokenManager, logger, Date.now() + 5000);
 
       expect(logger.warn).toHaveBeenCalledWith(
-        expect.stringContaining('Remote MCP server unreachable during discovery'),
+        'Remote MCP server unreachable during discovery, retrying',
         expect.any(Object),
       );
 
@@ -203,59 +258,12 @@ describe('Proxy resilience', () => {
         { capabilities: { sampling: {} } },
       );
       await endClient.connect(localTransportPair[0]);
-
-      // Wait for Phase 3 connection (calls 3-4 succeed)
       await new Promise((r) => setTimeout(r, 100));
 
       const caps = endClient.getServerCapabilities();
       expect(caps?.tools).toBeDefined();
       expect(caps?.resources).toBeDefined();
       expect(caps?.prompts).toBeDefined();
-    });
-
-    it('uses proxy identity when discovery fails', async () => {
-      transportCallCount = 0;
-      upstreamServers.length = 0;
-
-      transportShouldFail = (i) => i <= 2;
-
-      const config = createMockConfig();
-      const logger = createMockLogger();
-      const tokenManager = createMockTokenManager();
-
-      const { createProxy } = await import('../src/proxy.js');
-      proxyHandle = await createProxy(config, tokenManager, logger);
-
-      endClient = new Client(
-        { name: 'test-client', version: '2.5.0' },
-        { capabilities: {} },
-      );
-      await endClient.connect(localTransportPair[0]);
-
-      const serverInfo = endClient.getServerVersion();
-      expect(serverInfo?.name).toBe('mcp-client-credentials-auth');
-      expect(serverInfo?.version).toBe('0.1.0');
-    });
-
-    it('forwards requests after remote becomes available', async () => {
-      transportCallCount = 0;
-      upstreamServers.length = 0;
-
-      transportShouldFail = (i) => i <= 2;
-
-      const config = createMockConfig();
-      const logger = createMockLogger();
-      const tokenManager = createMockTokenManager();
-
-      const { createProxy } = await import('../src/proxy.js');
-      proxyHandle = await createProxy(config, tokenManager, logger);
-
-      endClient = new Client(
-        { name: 'test-client', version: '2.5.0' },
-        { capabilities: { sampling: {} } },
-      );
-      await endClient.connect(localTransportPair[0]);
-      await new Promise((r) => setTimeout(r, 100));
 
       const upstream = upstreamServers[upstreamServers.length - 1];
       upstream.fallbackRequestHandler = async (request) => {

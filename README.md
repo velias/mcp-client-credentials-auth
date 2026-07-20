@@ -19,8 +19,8 @@ To obtain the required `client_id` and `client_secret`, look for a "Service Acco
 - **Transparent forwarding** - all MCP methods forwarded bidirectionally (tools, resources, prompts, sampling, notifications)
 - **Proactive token refresh** - tokens refreshed before expiry using `refreshSkewSeconds` (default 30s) with automatic retries, no MCP request latency spikes
 - **Transport fallback** - Streamable HTTP with automatic SSE fallback for transport failures only (not authentication errors; both transports share the same IdP credentials)
-- **Resilient startup** - starts even when the remote MCP server or IdP is unavailable, connecting automatically when they become reachable
-- **Automatic reconnection** - detects remote server disconnects and reconnects with exponential backoff, preserving client identity and capabilities
+- **Fail-closed startup** - does not open the local stdio MCP session until a usable access token is available (when auth is required) and the remote MCP server is reachable; otherwise the process exits so your MCP client can show an error
+- **Automatic reconnection** - after a successful start, detects remote server disconnects and reconnects with exponential backoff, preserving client identity and capabilities
 - **Live change detection** - polls the remote server for capability changes (tools, resources, prompts) and notifies your MCP client automatically
 - **Identity forwarding** - remote server name and capabilities forwarded to your MCP client, your client's real identity and capabilities forwarded to the remote MCP server
 - **Timeouts on all network calls** - all outgoing connections (MCP requests, OAuth discovery, token acquisition) enforce `requestTimeoutMs` to prevent hangs
@@ -41,7 +41,7 @@ The auth proxy sits between your MCP client and the remote MCP server:
 3. Forwards all MCP requests/responses with `Bearer` authentication
 4. Handles token refresh and 401 retry transparently
 
-If the IdP is temporarily unavailable at startup, the auth proxy will periodically retry with exponential backoff (5s to 60s): OAuth rediscovery in the auto-discovery path, or token prefetch retries when using a manual token endpoint. It begins serving authenticated requests as soon as a token can be acquired. If the remote MCP server is unreachable at startup, the auth proxy will still start and accept connections from your MCP client, advertising default capabilities (tools, resources, prompts). It will automatically connect to the remote server when it becomes available.
+At startup the auth proxy retries OAuth discovery / token acquisition and the remote MCP connection within a single shared wall-clock budget (`MCP_CC_PROXY_STARTUP_TIMEOUT_MS`, default 60s). Only after both succeed does it bind stdio and accept your MCP client. If either is still unmet when the budget expires, the process exits non-zero so the MCP client can show the server in error. See [When the proxy starts or stays up](#when-the-proxy-starts-or-stays-up).
 
 ## Quick Start
 
@@ -79,6 +79,7 @@ All configuration via `MCP_CC_PROXY_*` environment variables:
 | `MCP_CC_PROXY_DEBUG` | No | `false` | Enable debug logging to stderr |
 | `MCP_CC_PROXY_REFRESH_SKEW_SECONDS` | No | `30` | Proactive token refresh window (seconds before token expiry) |
 | `MCP_CC_PROXY_REQUEST_TIMEOUT_MS` | No | `30000` | Timeout for all outgoing network calls: MCP requests, OAuth discovery, and token acquisition (ms) |
+| `MCP_CC_PROXY_STARTUP_TIMEOUT_MS` | No | `60000` | Single wall-clock budget to obtain a usable access token (when auth is required) and reach the remote MCP server before the process exits. Auth and remote retries share this deadline. |
 | `MCP_CC_PROXY_CAPABILITIES_POLL_SECONDS` | No | `60` | Interval to poll remote MCP server for capability changes (0 = disabled) |
 
 ### Servers without OAuth discovery
@@ -113,7 +114,7 @@ What changes versus auto-discovery via MCP Authorization and RFC 9728 / RFC 8414
 
 - Skips that discovery and uses your configured token endpoint instead
 - Still acquires tokens with `client_credentials`, attaches `Bearer` on MCP requests, and runs proactive refresh
-- If the IdP is down at startup, the proxy still starts and retries token acquisition in the background (5s to 60s backoff) until it succeeds
+- Startup still requires a usable token and a reachable remote MCP server within `MCP_CC_PROXY_STARTUP_TIMEOUT_MS` (same fail-closed gate as auto-discovery)
 
 Prefer auto-discovery via MCP Authorization and RFC 9728 / RFC 8414 when it is available. If you set `MCP_CC_PROXY_TOKEN_ENDPOINT`, the manual path is used even when discovery would have worked.
 
@@ -217,18 +218,43 @@ Every runtime failure is labeled with the same three categories in both JSON-RPC
 
 | Category | Meaning | Example |
 |----------|---------|---------|
-| `authentication` | Token/IdP failure (scopes, client secret, OAuth discovery) | `mcp-client-credentials-auth [authentication]: Invalid scopes: api.graphql` |
+| `authentication` | Token/IdP failure (no usable token, scopes, client secret, OAuth discovery) | `mcp-client-credentials-auth [authentication]: no usable access token` |
 | `connection` | Proxy cannot reach or stay connected to the remote MCP transport | `mcp-client-credentials-auth [connection]: temporarily unavailable (reconnecting)` |
 | `remote` | Remote MCP server returned a protocol/application error (including resource-server 401/403) | `mcp-client-credentials-auth [remote]: …` |
 
 Stderr lines also include `component=mcp-client-credentials-auth` so they remain attributable inside generic MCP client log panels.
+
+### When the proxy starts or stays up
+
+MCP clients (Cursor, Claude Desktop, VS Code, and others) typically treat a stdio server as healthy when the process is alive and the `initialize` handshake succeeds. They do not probe whether your IdP or remote MCP backend is working. This proxy therefore **fail-closes at startup** and **self-heals at runtime**:
+
+**Startup (process exits; your MCP client should show the server in error):**
+
+| Situation | Behavior |
+|-----------|----------|
+| IdP unreachable, OAuth discovery fails, or other **transient** token prefetch failures within `MCP_CC_PROXY_STARTUP_TIMEOUT_MS` | Retries with backoff inside the shared startup budget, then exits. Check stderr for the real cause. |
+| Permanent OAuth config rejection from the IdP (`invalid_scope`, `invalid_client`, `unauthorized_client`, etc.) | Immediate exit; no startup retries. Logged as **unrecoverable OAuth misconfiguration at the identity provider (IdP)** (the IdP rejected the token request, not the MCP server). Typical causes: wrong `MCP_CC_PROXY_SCOPES`, bad client id/secret, or grant not allowed for this client. Contact your MCP server provider. |
+| Remote MCP server rejects the access token at startup (401/`Unauthorized`, `invalid_token`, `insufficient_scope`, etc.) | Immediate exit; logged as **unrecoverable OAuth misconfiguration at the remote MCP server** (token was issued, then rejected by the MCP server). Contact your MCP server provider to correct token validation, scopes/audience, or issued credentials. |
+| Authorization server metadata does not advertise `client_credentials` (`unsupported-grant`) | Immediate exit; no startup retries. |
+| Remote server needs no OAuth (`no-auth`) | Token not required; remote MCP must still be reachable within the startup budget or the process exits. |
+| Remote MCP unreachable within the startup budget | Retries with backoff, then exits. Real remote capabilities are never invented; the local session is not opened. |
+
+**Runtime (process stays up; the UI may stay green; requests fail until recovery):**
+
+| Situation | Behavior |
+|-----------|----------|
+| Remote MCP disconnects | Requests get `connection` errors (e.g. `temporarily unavailable (reconnecting)`). Indefinite background reconnect with backoff; resumes when the remote is back. |
+| IdP down but a cached access token is still valid | Keeps serving until the token is no longer usable. |
+| No usable access token and refresh/auth fails | Requests get a short `authentication` error (`no usable access token`). Indefinite background refresh/retry; resumes when a token is acquired again. |
+
+**Client reconnect:** for stdio MCP, "reconnect" means the client respawns this process and runs a new `initialize`. The MCP spec says clients SHOULD restart an unexpectedly exited server; in practice Cursor and many UIs often need a manual toggle or Reload Window after a red startup failure. Mid-session problems show up on tool/resource calls, not necessarily as a red server dot.
 
 ### Token acquired but remote server returns 403
 
 If the proxy acquires a token but the remote server rejects requests, the token likely has fewer scopes than expected. IdPs handle scopes in `client_credentials` differently:
 
 - **Silent dropping** (Keycloak, Auth0): scopes not assigned to the client in the IdP are quietly removed from the token without an error. The proxy gets a valid token that lacks the permissions the MCP server requires. This is the hardest case to debug.
-- **Strict rejection** (Okta, AWS Cognito): requesting a scope not assigned to the client fails the token request immediately with `invalid_scope`. Easier to diagnose since the proxy logs `Token prefetch failed (will retry on first request)` at startup.
+- **Strict rejection** (Okta, AWS Cognito): requesting a scope not assigned to the client fails the token request immediately with `invalid_scope`. At startup the proxy exits immediately and logs an **unrecoverable OAuth misconfiguration at the identity provider (IdP)** (no retries; cannot self-heal). Contact your MCP server provider to correct credentials, scopes, or IdP grants.
 - **`.default` convention** (Entra ID / Azure AD): individual scope names are not accepted; you must use `{resource}/.default`. Set `MCP_CC_PROXY_SCOPES` to override with the `.default` format; check the remote MCP server's documentation for the exact value. If permissions are still missing, the issue is likely missing admin consent on the app registration; contact the MCP server operator or your Azure AD tenant administrator.
 
 **Debugging steps:**

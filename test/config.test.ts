@@ -31,6 +31,7 @@ describe('Config', () => {
     const config = loadConfig();
     expect(config.refreshSkewSeconds).toBe(30);
     expect(config.requestTimeoutMs).toBe(30000);
+    expect(config.startupTimeoutMs).toBe(60000);
     expect(config.debug).toBe(false);
   });
 
@@ -38,9 +39,11 @@ describe('Config', () => {
     setRequiredEnv();
     process.env.MCP_CC_PROXY_REFRESH_SKEW_SECONDS = '60';
     process.env.MCP_CC_PROXY_REQUEST_TIMEOUT_MS = '5000';
+    process.env.MCP_CC_PROXY_STARTUP_TIMEOUT_MS = '15000';
     const config = loadConfig();
     expect(config.refreshSkewSeconds).toBe(60);
     expect(config.requestTimeoutMs).toBe(5000);
+    expect(config.startupTimeoutMs).toBe(15000);
   });
 
   it('parses debug flag', () => {
