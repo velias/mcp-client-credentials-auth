@@ -9,16 +9,36 @@ import type { TokenManager, AuthMode } from '../src/token-manager.js';
 
 const permissiveSchema = z.object({}).passthrough();
 
+/** Matches SDK StreamableHTTPError shape for isStaleRemoteSessionError duck-typing. */
+class FakeStreamableHTTPError extends Error {
+  constructor(
+    readonly code: number,
+    message: string,
+  ) {
+    super(`Streamable HTTP error: ${message}`);
+    this.name = 'StreamableHTTPError';
+  }
+}
+
 let localTransportPair: [InMemoryTransport, InMemoryTransport];
 const upstreamServers: Server[] = [];
 let connectCount = 0;
+/** When set, every new upstream serves this tools/list payload (survives reconnect). */
+let upstreamToolsList:
+  | { tools: Array<{ name: string; description: string; inputSchema: { type: 'object' } }> }
+  | undefined;
 
 function createUpstreamServer() {
   const server = new Server(
     { name: 'mock-upstream', version: '1.0.0' },
     { capabilities: { tools: {}, resources: {}, prompts: {} } },
   );
-  server.fallbackRequestHandler = async () => ({});
+  server.fallbackRequestHandler = async (request) => {
+    if (request.method === 'tools/list' && upstreamToolsList) {
+      return upstreamToolsList;
+    }
+    return {};
+  };
   server.fallbackNotificationHandler = async () => {};
   upstreamServers.push(server);
   return server;
@@ -111,13 +131,15 @@ function createMockTokenManager(mode: AuthMode = { type: 'authenticated', provid
 describe('Proxy (createProxy integration)', () => {
   let endClient: Client;
   let proxyHandle: { close(): Promise<void> };
+  let logger: Logger;
 
   beforeEach(async () => {
     connectCount = 0;
     upstreamServers.length = 0;
+    upstreamToolsList = undefined;
 
     const config = createMockConfig();
-    const logger = createMockLogger();
+    logger = createMockLogger();
     const tokenManager = createMockTokenManager();
 
     const { createProxy } = await import('../src/proxy.js');
@@ -512,6 +534,82 @@ describe('Proxy (createProxy integration)', () => {
       // close() sets reconnecting=true, so onclose should NOT trigger a reconnect
       // Only the close itself should have run, no new connections
       expect(connectCount).toBe(countBefore);
+    });
+
+    it('recovers from stale Streamable HTTP session and retries the request', async () => {
+      upstreamToolsList = {
+        tools: [
+          { name: 'after-session', description: 'ok', inputSchema: { type: 'object' as const } },
+        ],
+      };
+
+      const connectsBefore = connectCount;
+      const originalRequest = Client.prototype.request;
+      const requestSpy = vi.spyOn(Client.prototype, 'request').mockImplementation(async function (
+        this: Client,
+        ...args: Parameters<typeof originalRequest>
+      ) {
+        const req = args[0] as { method?: string };
+        if (this !== endClient && req.method === 'tools/list' && connectCount === connectsBefore) {
+          throw new FakeStreamableHTTPError(
+            404,
+            'Error POSTing to endpoint: {"jsonrpc":"2.0","id":"server-error","error":{"code":-32001,"message":"Session not found"}}',
+          );
+        }
+        return originalRequest.apply(this, args);
+      });
+
+      try {
+        const result = await endClient.listTools();
+        expect(result.tools[0]?.name).toBe('after-session');
+        expect(connectCount).toBeGreaterThan(connectsBefore);
+        expect(logger.warn).toHaveBeenCalledWith(
+          'Remote Streamable HTTP session lost, recreating session',
+          expect.objectContaining({ category: 'connection', method: 'tools/list' }),
+        );
+        expect(logger.info).toHaveBeenCalledWith('Remote Streamable HTTP session reacquired');
+      } finally {
+        requestSpy.mockRestore();
+      }
+    });
+
+    it('coalesces concurrent stale-session recoveries into one reconnect', async () => {
+      upstreamToolsList = {
+        tools: [
+          { name: 'coalesced', description: 'ok', inputSchema: { type: 'object' as const } },
+        ],
+      };
+
+      const connectsBefore = connectCount;
+      const originalRequest = Client.prototype.request;
+      const requestSpy = vi.spyOn(Client.prototype, 'request').mockImplementation(async function (
+        this: Client,
+        ...args: Parameters<typeof originalRequest>
+      ) {
+        const req = args[0] as { method?: string };
+        if (this !== endClient && req.method === 'tools/list' && connectCount === connectsBefore) {
+          throw new FakeStreamableHTTPError(404, 'Error POSTing to endpoint: Session not found');
+        }
+        return originalRequest.apply(this, args);
+      });
+
+      try {
+        const [a, b] = await Promise.all([endClient.listTools(), endClient.listTools()]);
+        expect(a.tools[0]?.name).toBe('coalesced');
+        expect(b.tools[0]?.name).toBe('coalesced');
+        // One recovery reconnect (discovery + phase3 already counted in connectsBefore)
+        expect(connectCount).toBe(connectsBefore + 1);
+        const lostLogs = vi.mocked(logger.warn).mock.calls.filter(
+          (call) => call[0] === 'Remote Streamable HTTP session lost, recreating session',
+        );
+        expect(lostLogs).toHaveLength(1);
+        const reacquiredLogs = vi.mocked(logger.info).mock.calls.filter(
+          (call) => call[0] === 'Remote Streamable HTTP session reacquired',
+        );
+        expect(reacquiredLogs).toHaveLength(1);
+      } finally {
+        requestSpy.mockRestore();
+      }
     });
   });
 });

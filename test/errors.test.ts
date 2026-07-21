@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { UnauthorizedError } from '@modelcontextprotocol/sdk/client/auth.js';
+import { StreamableHTTPError } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
 import {
   PROXY_NAME,
@@ -7,6 +8,7 @@ import {
   formatProxyError,
   formatUnrecoverableOAuthMisconfig,
   isPermanentOAuthConfigError,
+  isStaleRemoteSessionError,
   isUnrecoverableStartupAuthError,
   toClientError,
   wrapCaughtError,
@@ -101,6 +103,47 @@ describe('errors', () => {
         readonly errorCode = 'server_error';
       }
       expect(isUnrecoverableStartupAuthError(new FakeServerError('IdP busy'))).toBe(false);
+    });
+  });
+
+  describe('isStaleRemoteSessionError', () => {
+    it('returns true for StreamableHTTPError with HTTP 404 (spec primary)', () => {
+      expect(isStaleRemoteSessionError(new StreamableHTTPError(404, 'Error POSTing to endpoint: gone'))).toBe(
+        true,
+      );
+    });
+
+    it('returns true for 404 without session wording in the body', () => {
+      expect(isStaleRemoteSessionError(new StreamableHTTPError(404, 'Not Found'))).toBe(true);
+    });
+
+    it('returns true for product-adapter Session not found body (compat)', () => {
+      const err = new Error(
+        'Streamable HTTP error: Error POSTing to endpoint: {"jsonrpc":"2.0","id":"server-error","error":{"code":-32600,"message":"Session not found"}}',
+      );
+      expect(isStaleRemoteSessionError(err)).toBe(true);
+    });
+
+    it('returns true for non-404 transport errors with session message (compat)', () => {
+      expect(
+        isStaleRemoteSessionError(
+          new StreamableHTTPError(400, 'Bad Request: No valid session ID provided'),
+        ),
+      ).toBe(true);
+      expect(isStaleRemoteSessionError(new Error('invalid session'))).toBe(true);
+    });
+
+    it('returns false for unrelated connection, auth, and remote errors', () => {
+      expect(isStaleRemoteSessionError(new Error('fetch failed'))).toBe(false);
+      expect(isStaleRemoteSessionError(new StreamableHTTPError(500, 'Error POSTing to endpoint: boom'))).toBe(
+        false,
+      );
+      expect(isStaleRemoteSessionError(new StreamableHTTPError(400, 'Bad Request'))).toBe(false);
+      expect(isStaleRemoteSessionError(new UnauthorizedError('Unauthorized'))).toBe(false);
+      expect(isStaleRemoteSessionError(new FakeInvalidScopeError('Invalid scopes'))).toBe(false);
+      expect(isStaleRemoteSessionError(new McpError(ErrorCode.InternalError, 'tool failed'))).toBe(
+        false,
+      );
     });
   });
 

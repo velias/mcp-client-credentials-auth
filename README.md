@@ -20,7 +20,7 @@ To obtain the required `client_id` and `client_secret`, look for a "Service Acco
 - **Proactive token refresh** - tokens refreshed before expiry using `refreshSkewSeconds` (default 30s) with automatic retries, no MCP request latency spikes
 - **Transport fallback** - Streamable HTTP with automatic SSE fallback for transport failures only (not authentication errors; both transports share the same IdP credentials)
 - **Fail-closed startup** - does not open the local stdio MCP session until a usable access token is available (when auth is required) and the remote MCP server is reachable; otherwise the process exits so your MCP client can show an error
-- **Automatic reconnection** - after a successful start, detects remote server disconnects and reconnects with exponential backoff, preserving client identity and capabilities
+- **Automatic reconnection** - after a successful start, detects remote server disconnects and stale Streamable HTTP sessions (e.g. remote restart / HTTP 404 session loss), reconnects with exponential backoff, retries the failed request once, and preserves client identity and capabilities
 - **Live change detection** - polls the remote server for capability changes (tools, resources, prompts) and notifies your MCP client automatically
 - **Identity forwarding** - remote server name and capabilities forwarded to your MCP client, your client's real identity and capabilities forwarded to the remote MCP server
 - **Timeouts on all network calls** - all outgoing connections (MCP requests, OAuth discovery, token acquisition) enforce `requestTimeoutMs` to prevent hangs
@@ -244,6 +244,7 @@ MCP clients (Cursor, Claude Desktop, VS Code, and others) typically treat a stdi
 | Situation | Behavior |
 |-----------|----------|
 | Remote MCP disconnects | Requests get `connection` errors (e.g. `temporarily unavailable (reconnecting)`). Indefinite background reconnect with backoff; resumes when the remote is back. |
+| Remote MCP restarted / Streamable HTTP session not found | Detects stale session (HTTP 404 or session-loss message), recreates the remote session, retries the request once; logs session lost and session reacquired on stderr. |
 | IdP down but a cached access token is still valid | Keeps serving until the token is no longer usable. |
 | No usable access token and refresh/auth fails | Requests get a short `authentication` error (`no usable access token`). Indefinite background refresh/retry; resumes when a token is acquired again. |
 
