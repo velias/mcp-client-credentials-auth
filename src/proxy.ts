@@ -13,6 +13,7 @@ import {
   classifyError,
   errorDetail,
   formatUnrecoverableOAuthMisconfig,
+  isStaleRemoteSessionError,
   resolveUnrecoverableStartupAuthSource,
   toClientError,
   wrapCaughtError,
@@ -297,8 +298,11 @@ export async function createProxy(
   let storedIdentity: Implementation | undefined;
   let storedCapabilities: ClientCapabilities | undefined;
   let reconnecting = false;
+  let closingIntentionally = false;
   let reconnectAttempt = 0;
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  let reconnectPromise: Promise<void> | undefined;
+  let sessionRecoveryPromise: Promise<boolean> | undefined;
   let lastStableConnect = 0;
   const RECONNECT_BASE_MS = 1000;
   const RECONNECT_MAX_MS = 60000;
@@ -310,21 +314,65 @@ export async function createProxy(
     return Math.round(exponential + jitter);
   }
 
+  function scheduleReconnect(): Promise<void> {
+    if (!reconnectPromise) {
+      reconnectPromise = reconnect().finally(() => {
+        reconnectPromise = undefined;
+      });
+    }
+    return reconnectPromise;
+  }
+
   function wireOnClose(client: Client): void {
     client.onclose = () => {
-      if (reconnecting) return;
+      if (reconnecting || closingIntentionally) return;
       if (lastStableConnect > 0 && Date.now() - lastStableConnect > RECONNECT_STABLE_THRESHOLD_MS) {
         reconnectAttempt = 0;
       }
       logger.warn('Remote connection lost, attempting reconnection');
-      void reconnect();
+      void scheduleReconnect();
     };
   }
 
-  async function reconnect(): Promise<void> {
+  /** Wire handlers, notify list changes, and start polling for a newly connected remote client. */
+  async function adoptRemoteClient(client: Client): Promise<void> {
+    remoteClient = client;
+    wireRemoteHandlers(client);
+    wireOnClose(client);
+
+    const newCaps = client.getServerCapabilities() ?? {};
+    checkCapabilityChanges(newCaps);
+    await notifyListChanges(newCaps);
+    startPolling();
+  }
+
+  /**
+   * Clear the current remote client and stop polling.
+   * `close: true` closes the transport (stale-session path; onclose is suppressed via reconnecting).
+   * `holdReconnecting: true` leaves reconnecting=true for the caller (reconnect path).
+   */
+  async function dropRemoteClient(options: {
+    close: boolean;
+    holdReconnecting?: boolean;
+  }): Promise<void> {
     reconnecting = true;
     stopPolling();
+    const previous = remoteClient;
     remoteClient = undefined;
+    if (options.close && previous) {
+      try {
+        await previous.close();
+      } catch {
+        // Stale transport close errors are expected after remote restart.
+      }
+    }
+    if (!options.holdReconnecting) {
+      reconnecting = false;
+    }
+  }
+
+  async function reconnect(): Promise<void> {
+    await dropRemoteClient({ close: false, holdReconnecting: true });
 
     if (!storedIdentity || !storedCapabilities) {
       logger.error('Cannot reconnect: no stored identity/capabilities');
@@ -343,17 +391,15 @@ export async function createProxy(
       });
     }
 
+    if (closingIntentionally) {
+      reconnecting = false;
+      return;
+    }
+
     logger.info('Attempting reconnection', { attempt: reconnectAttempt + 1 });
     try {
-      remoteClient = await connectRemote(storedIdentity, storedCapabilities);
-      wireRemoteHandlers(remoteClient);
-      wireOnClose(remoteClient);
-
-      const newCaps = remoteClient.getServerCapabilities() ?? {};
-      checkCapabilityChanges(newCaps);
-      await notifyListChanges(newCaps);
-
-      startPolling();
+      const client = await connectRemote(storedIdentity, storedCapabilities);
+      await adoptRemoteClient(client);
       lastStableConnect = Date.now();
       if (reconnectAttempt > 0) {
         logger.info('Reconnection successful', { afterAttempts: reconnectAttempt + 1 });
@@ -372,11 +418,54 @@ export async function createProxy(
       remoteClient = undefined;
       reconnectAttempt++;
       reconnecting = false;
-      void reconnect();
+      // Schedule the next attempt after this coalesced promise settles (avoid nested await deadlock).
+      queueMicrotask(() => {
+        if (!closingIntentionally && !remoteClient) {
+          void scheduleReconnect();
+        }
+      });
       return;
     } finally {
       reconnecting = false;
     }
+  }
+
+  /**
+   * Drop a live-but-stale Streamable HTTP session and reconnect (new initialize / session id).
+   * Concurrent callers share one recovery; logs the session lost / reacquired pair once.
+   */
+  function recoverStaleRemoteSession(options: {
+    method?: string;
+    error: unknown;
+  }): Promise<boolean> {
+    if (!sessionRecoveryPromise) {
+      sessionRecoveryPromise = (async () => {
+        logger.warn('Remote Streamable HTTP session lost, recreating session', {
+          category: 'connection',
+          ...(options.method !== undefined ? { method: options.method } : {}),
+          error: errorDetail(options.error),
+        });
+
+        if (remoteClient) {
+          await dropRemoteClient({ close: true });
+        }
+
+        await scheduleReconnect();
+
+        if (remoteClient) {
+          logger.info('Remote Streamable HTTP session reacquired');
+          return true;
+        }
+
+        logger.warn('Failed to reacquire remote Streamable HTTP session, will keep retrying', {
+          category: 'connection',
+        });
+        return false;
+      })().finally(() => {
+        sessionRecoveryPromise = undefined;
+      });
+    }
+    return sessionRecoveryPromise;
   }
 
   localServer.oninitialized = () => {
@@ -397,15 +486,8 @@ export async function createProxy(
 
     void (async () => {
       try {
-        remoteClient = await connectRemote(identity, capabilities);
-        wireRemoteHandlers(remoteClient);
-        wireOnClose(remoteClient);
-
-        const newCaps = remoteClient.getServerCapabilities() ?? {};
-        checkCapabilityChanges(newCaps);
-        await notifyListChanges(newCaps);
-
-        startPolling();
+        const client = await connectRemote(identity, capabilities);
+        await adoptRemoteClient(client);
         readyResolve();
       } catch (err) {
         const detail = errorDetail(err);
@@ -415,10 +497,24 @@ export async function createProxy(
           error: detail,
         });
         readyResolve();
-        void reconnect();
+        void scheduleReconnect();
       }
     })();
   };
+
+  async function forwardRequest(
+    method: string,
+    params: Record<string, unknown> | undefined,
+  ): Promise<Record<string, unknown>> {
+    if (!remoteClient) {
+      throw toClientError('connection', 'temporarily unavailable (reconnecting)');
+    }
+    return remoteClient.request(
+      { method, params },
+      permissiveSchema,
+      { timeout: config.requestTimeoutMs },
+    );
+  }
 
   // Flow 1: Client->Server REQUESTS
   localServer.fallbackRequestHandler = async (request) => {
@@ -433,18 +529,32 @@ export async function createProxy(
       throw toClientError('authentication', 'no usable access token');
     }
 
-    if (!remoteClient) {
-      throw toClientError('connection', 'temporarily unavailable (reconnecting)');
-    }
-
     const sanitizedParams = sanitizeMeta(request.params);
+
     try {
-      return await remoteClient.request(
-        { method: request.method, params: sanitizedParams },
-        permissiveSchema,
-        { timeout: config.requestTimeoutMs },
-      );
+      return await forwardRequest(request.method, sanitizedParams);
     } catch (err) {
+      if (isStaleRemoteSessionError(err)) {
+        const recovered = await recoverStaleRemoteSession({
+          method: request.method,
+          error: err,
+        });
+        if (recovered) {
+          try {
+            return await forwardRequest(request.method, sanitizedParams);
+          } catch (retryErr) {
+            const category = classifyError(retryErr);
+            logger.warn('Remote request failed after session reacquire', {
+              category,
+              method: request.method,
+              error: errorDetail(retryErr),
+            });
+            throw wrapCaughtError(retryErr);
+          }
+        }
+        throw toClientError('connection', 'temporarily unavailable (reconnecting)');
+      }
+
       const category = classifyError(err);
       logger.warn('Remote request failed', {
         category,
@@ -471,11 +581,10 @@ export async function createProxy(
   await localServer.connect(stdioTransport);
   logger.info('Local MCP server started on stdio');
 
-  let closingIntentionally = false;
-
   localServer.onclose = () => {
     if (closingIntentionally) return;
     logger.info('Local client disconnected, shutting down');
+    closingIntentionally = true;
     reconnecting = true;
     stopPolling();
     if (remoteClient) {
@@ -554,6 +663,9 @@ export async function createProxy(
           category,
           error: detail,
         });
+        if (isStaleRemoteSessionError(err)) {
+          void recoverStaleRemoteSession({ error: err });
+        }
       }
     };
 

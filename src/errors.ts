@@ -10,6 +10,9 @@ export type ClassifyContext = 'token' | 'transport';
 
 const OAUTH_ERROR_CODE_KEY = 'errorCode';
 
+/** Session-loss phrases used by non-spec or older servers (secondary detection). */
+const STALE_SESSION_MESSAGE_RE = /session not found|no valid session|invalid session|unknown session/i;
+
 function hasOAuthErrorCode(err: unknown): err is Error & { errorCode: string } {
   return (
     err instanceof Error &&
@@ -104,6 +107,49 @@ export function formatUnrecoverableOAuthMisconfig(
 
 export function errorDetail(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Read HTTP status from a StreamableHTTPError-shaped failure.
+ * Duck-typed so tests can mock the transport module without exporting the class,
+ * and so wrapped copies that preserve `code` + the SDK message prefix still match.
+ */
+function getStreamableHttpStatus(err: unknown): number | undefined {
+  if (
+    err instanceof Error &&
+    'code' in err &&
+    typeof (err as { code: unknown }).code === 'number' &&
+    err.message.startsWith('Streamable HTTP error:')
+  ) {
+    return (err as { code: number }).code;
+  }
+  return undefined;
+}
+
+function hasStaleSessionMessage(err: unknown): boolean {
+  return STALE_SESSION_MESSAGE_RE.test(errorDetail(err));
+}
+
+/**
+ * True when a mid-session Streamable HTTP failure indicates the remote session is gone
+ * (e.g. remote restart) and the proxy should recreate the session.
+ *
+ * Primary: HTTP 404 from Streamable HTTP (MCP transport spec).
+ * Secondary: body/message clearly about a missing/invalid session (compat for non-404 servers).
+ *
+ * Call only after a live remote session existed; do not use for Phase 1 connect failures.
+ */
+export function isStaleRemoteSessionError(err: unknown): boolean {
+  if (err instanceof McpError || err instanceof UnauthorizedError || hasOAuthErrorCode(err)) {
+    return false;
+  }
+
+  const status = getStreamableHttpStatus(err);
+  if (status === 404) {
+    return true;
+  }
+
+  return hasStaleSessionMessage(err);
 }
 
 /**
