@@ -1058,5 +1058,69 @@ describe('TokenManager', () => {
       await tm.discover();
       expect(typeof tm.getScopeStepUpFetch()).toBe('function');
     });
+
+    it('restores prior scopes and access token when step-up auth fails', async () => {
+      setupAuthenticatedDiscovery();
+      mockAuth.mockImplementation(async (provider) => {
+        await Promise.resolve(provider.saveTokens({
+          access_token: 'good-token',
+          token_type: 'bearer',
+          expires_in: 3600,
+        }));
+        return 'AUTHORIZED';
+      });
+
+      const tm = createTokenManager(createTestConfig(), createMockLogger());
+      await tm.discover();
+      await tm.prefetch();
+      expect(tm.getAccessToken()).toBe('good-token');
+      expect(tm.getCurrentScopes()).toBe('read write');
+
+      mockAuth.mockRejectedValueOnce(
+        Object.assign(new Error('Invalid scopes: evil.admin'), { errorCode: 'invalid_scope' }),
+      );
+
+      await expect(tm.stepUpScopes('evil.admin')).rejects.toThrow(/Invalid scopes: evil\.admin/);
+
+      const provider = tm.getAuthProvider() as { clientMetadata: { scope?: string } };
+      expect(provider.clientMetadata.scope).toBe('read write');
+      expect(tm.getCurrentScopes()).toBe('read write');
+      expect(tm.getAccessToken()).toBe('good-token');
+      expect(tm.hasUsableAccessToken()).toBe(true);
+    });
+
+    it('restores baseline when a concurrent challenge poisons an in-flight step-up', async () => {
+      setupAuthenticatedDiscovery();
+      mockAuth.mockImplementation(async (provider) => {
+        await Promise.resolve(provider.saveTokens({
+          access_token: 'good-token',
+          token_type: 'bearer',
+          expires_in: 3600,
+        }));
+        return 'AUTHORIZED';
+      });
+
+      const tm = createTokenManager(createTestConfig(), createMockLogger());
+      await tm.discover();
+      await tm.prefetch();
+
+      let authCalls = 0;
+      mockAuth.mockImplementation(async () => {
+        authCalls++;
+        await Promise.resolve();
+        throw Object.assign(new Error('Invalid scopes'), { errorCode: 'invalid_scope' });
+      });
+
+      const results = await Promise.allSettled([
+        tm.stepUpScopes('email'),
+        tm.stepUpScopes('evil.admin'),
+      ]);
+
+      expect(results.every((r) => r.status === 'rejected')).toBe(true);
+      expect(authCalls).toBeGreaterThanOrEqual(1);
+      expect(tm.getCurrentScopes()).toBe('read write');
+      expect(tm.getAccessToken()).toBe('good-token');
+      expect(tm.hasUsableAccessToken()).toBe(true);
+    });
   });
 });
