@@ -245,6 +245,8 @@ MCP clients (Cursor, Claude Desktop, VS Code, and others) typically treat a stdi
 |-----------|----------|
 | Remote MCP disconnects | Requests get `connection` errors (e.g. `temporarily unavailable (reconnecting)`). Indefinite background reconnect with backoff; resumes when the remote is back. |
 | Remote MCP restarted / Streamable HTTP session not found | Detects stale session (HTTP 404 or session-loss message), recreates the remote session, retries the request once; logs session lost and session reacquired on stderr. |
+| Remote MCP (or PRM) required scopes change while the proxy is running | Not detected automatically; refresh keeps prior scopes. Restart the proxy (and update `MCP_CC_PROXY_SCOPES` if used). |
+| Remote MCP Server or IdP discovery document changes while the proxy is running | Not detected automatically. Restart the proxy. |
 | IdP down but a cached access token is still valid | Keeps serving until the token is no longer usable. |
 | No usable access token and refresh/auth fails | Requests get a short `authentication` error (`no usable access token`). Indefinite background refresh/retry; resumes when a token is acquired again. |
 
@@ -264,6 +266,12 @@ If the proxy acquires a token but the remote server rejects requests, the token 
 2. Request a token directly from your IdP's token endpoint (using `curl` or your IdP's admin UI), decode it at [jwt.io](https://jwt.io) or with `jq`, and inspect the `scope` or `scp` claim to see what was actually granted.
 3. Compare with the scopes the remote MCP server requires for the failing operation.
 4. If scopes are missing, update the scope grants on your service account in the IdP, or contact the MCP server operator.
+
+### OAuth discovery and scopes are fixed at startup
+
+Protected resource metadata (RFC 9728), authorization server metadata (RFC 8414), and the scopes used for `client_credentials` are resolved once when the proxy starts (or taken from `MCP_CC_PROXY_SCOPES` / a manual token endpoint). Proactive refresh and token expiry acquire a new token with the same scopes; they do not re-fetch those descriptors.
+
+If the remote MCP server later requires additional scopes, or IdP/PRM metadata changes, restart the proxy process so discovery runs again. If you use `MCP_CC_PROXY_SCOPES`, update that value and restart. Some servers return `401`/`invalid_token` for missing scopes instead of `403`/`insufficient_scope`, so this proxy cannot reliably step up scopes in this case.
 
 ## Notes for MCP Server Developers
 
