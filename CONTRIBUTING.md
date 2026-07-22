@@ -40,7 +40,7 @@ Release notes are auto-generated from merged PRs (see [RELEASING.md](RELEASING.m
 
 ## Development Setup
 
-**Prerequisites:** Node.js >= 18.x, npm
+**Prerequisites:** Node.js >= 20, npm
 
 ```bash
 git clone https://github.com/velias/mcp-client-credentials-auth.git
