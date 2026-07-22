@@ -8,7 +8,7 @@ A local stdio MCP server that authenticates to remote OAuth-protected MCP server
 
 Drop it into any MCP client configuration for autonomous agents, background services, CI/CD, and other machine-to-machine use (no user in the loop). It acquires access tokens and forwards MCP traffic transparently. By default the token endpoint and scopes are auto-discovered via [MCP Authorization](https://modelcontextprotocol.io/specification/2025-11-05/basic/authorization) and RFC 9728 / RFC 8414. When discovery is unavailable, set a manual token endpoint; see [Servers without OAuth discovery](#servers-without-oauth-discovery).
 
-To obtain `client_id` and `client_secret`, look for a "Service Account", "API Key", or "Machine-to-Machine Application" option in the remote MCP service's account or developer settings. Naming varies by provider; the service controls which scopes the credentials receive.
+To obtain `client_id` and `client_secret`, look for a "Service Account", "API Key", or "Machine-to-Machine Application" option in the remote MCP service's account or developer settings. Naming varies by provider. Well-behaved services issue credentials that already work with their MCP Server published discovery metadata (or provide instructions how to self-grant them), so you normally need only the remote URL plus those two values (see [Notes for MCP Server Developers](#notes-for-mcp-server-developers)).
 
 ## How It Works
 
@@ -23,8 +23,11 @@ MCP Client ←→ [stdio] ←→ mcp-client-credentials-auth ←→ [HTTP/SSE + 
 2. Acquires tokens with OAuth `client_credentials`
 3. Forwards all MCP methods bidirectionally with `Bearer` authentication
 4. Refreshes tokens proactively and retries on 401
+5. On Streamable HTTP, if the remote returns `403` with `insufficient_scope`, can expand scopes, get a new token, and retry once (see [Known Issues](#scope-step-up-and-the-mcp-typescript-sdk))
 
-Also: Streamable HTTP with SSE fallback for transport failures only; fail-closed startup (stdio binds only after a usable token when auth is required and the remote is reachable); automatic reconnection and stale Streamable HTTP session recovery; capability polling; identity/capability forwarding; timeouts on all outgoing calls; generic pass-through (no hardcoded method tables). See [When the proxy starts or stays up](#when-the-proxy-starts-or-stays-up).
+Designed for minimal end-user config: with MCP Authorization discovery, URL + `client_id` + `client_secret` is enough when the MCP service's discovery and issued credentials line up. Manual `MCP_CC_PROXY_TOKEN_ENDPOINT` / `MCP_CC_PROXY_SCOPES` are escape hatches (no discovery, Entra `.default`, or provider-documented overrides), not the default path.
+
+Other features: Streamable HTTP with SSE fallback for transport failures only; fail-closed startup (stdio binds only after a usable token when auth is required and the remote is reachable); automatic reconnection and stale Streamable HTTP session recovery; capability polling; identity/capability forwarding; timeouts on all outgoing calls; generic pass-through (no hardcoded method tables).
 
 ## Quick Start
 
@@ -58,7 +61,7 @@ All configuration via `MCP_CC_PROXY_*` environment variables:
 | `MCP_CC_PROXY_CLIENT_ID` | Yes | — | OAuth client_id |
 | `MCP_CC_PROXY_CLIENT_SECRET` | Yes | — | OAuth client_secret |
 | `MCP_CC_PROXY_TOKEN_ENDPOINT` | No | — | IdP token endpoint URL. When set, skips MCP Authorization discovery and posts tokens here. Prefer `https://`; cleartext HTTP to a non-loopback host logs a warning. See [Servers without OAuth discovery](#servers-without-oauth-discovery). |
-| `MCP_CC_PROXY_SCOPES` | No | auto-discovered | Space-separated scopes for the token request. Overrides discovered `scopes_supported`. Required in practice with a manual token endpoint. See [Notes for MCP Server Developers](#notes-for-mcp-server-developers). |
+| `MCP_CC_PROXY_SCOPES` | No | auto-discovered | Space-separated scopes for the token request. Overrides discovered `scopes_supported`. Needed mainly with a manual token endpoint, Entra `.default`, or when the MCP server provider documents an override; prefer discovery + provider-issued credentials that already match. See [Notes for MCP Server Developers](#notes-for-mcp-server-developers). |
 | `MCP_CC_PROXY_DEBUG` | No | `false` | Enable debug logging to stderr |
 | `MCP_CC_PROXY_REFRESH_SKEW_SECONDS` | No | `30` | Proactive token refresh window (seconds before expiry) |
 | `MCP_CC_PROXY_REQUEST_TIMEOUT_MS` | No | `30000` | Timeout for MCP requests, OAuth discovery, and token acquisition (ms) |
@@ -230,18 +233,18 @@ MCP clients typically treat a stdio server as healthy when the process is alive 
 
 ### Token acquired but remote server returns 403
 
-If the proxy acquires a token but the remote server rejects requests, the token likely has fewer scopes than expected. IdPs handle scopes in `client_credentials` differently:
+Without `MCP_CC_PROXY_SCOPES`, the proxy requests the full discovered `scopes_supported` string. End users should not need to trim that list: the MCP service that issued your `client_id` / `client_secret` should have granted the scopes discovery will request, or provide you instructions how to self-setup them. If that alignment is wrong, contact the MCP server provider (or use a provider-documented `MCP_CC_PROXY_SCOPES` override). IdP behavior when the requested set is wider than the client grant:
 
-- **Silent dropping** (Keycloak, Auth0): scopes not assigned to the client in the IdP are quietly removed from the token without an error. The proxy gets a valid token that lacks the permissions the MCP server requires. This is the hardest case to debug.
-- **Strict rejection** (Okta, AWS Cognito): requesting a scope not assigned to the client fails the token request immediately with `invalid_scope`. At startup the proxy exits immediately and logs an **unrecoverable OAuth misconfiguration at the identity provider (IdP)** (no retries; cannot self-heal). Contact your MCP server provider to correct credentials, scopes, or IdP grants.
-- **`.default` convention** (Entra ID / Azure AD): individual scope names are not accepted; you must use `{resource}/.default` via `MCP_CC_PROXY_SCOPES`. See [Entra ID (Azure AD) compatibility](#entra-id-azure-ad-compatibility). If permissions are still missing, the issue is often missing admin consent on the app registration.
+- **Silent dropping** (Keycloak, Auth0): disallowed scopes are removed from the token without error. The proxy starts but may lack permissions; hardest to debug. Runtime `403`/`insufficient_scope` step-up can request more later if the IdP will grant them.
+- **Strict rejection** (Okta, AWS Cognito): any disallowed scope fails the token request with `invalid_scope`. Startup exits immediately (**unrecoverable OAuth misconfiguration at the identity provider**). This is a provider/credentials misconfiguration for zero-config use; step-up never runs.
+- **`.default` convention** (Entra ID / Azure AD): individual scope names are not accepted; providers should document `MCP_CC_PROXY_SCOPES={resource}/.default`. See [Entra ID (Azure AD) compatibility](#entra-id-azure-ad-compatibility).
 
 **Debugging steps:**
 
 1. Look for the startup scopes log: `OAuth discovery complete` (auto-discovery) or `Using manual token endpoint (skipping OAuth discovery)` (manual token endpoint). The `scopes` field shows what will be requested, or `(default)` / `(none)` if none were set.
 2. Request a token directly from your IdP's token endpoint (using `curl` or your IdP's admin UI), decode it at [jwt.io](https://jwt.io) or with `jq`, and inspect the `scope` or `scp` claim to see what was actually granted.
 3. Compare with the scopes the remote MCP server requires for the failing operation.
-4. If scopes are missing, update the scope grants on your service account in the IdP, or contact the MCP server operator.
+4. If scopes are missing, contact the MCP server operator (or follow their documented `MCP_CC_PROXY_SCOPES` / consent steps).
 
 ### OAuth discovery and scopes are fixed at startup
 
@@ -251,25 +254,35 @@ If required scopes or IdP/PRM metadata change, restart the proxy (and update `MC
 
 ## Notes for MCP Server Developers
 
-If you publish [RFC 9728 Protected Resource Metadata](https://datatracker.ietf.org/doc/html/rfc9728), `scopes_supported` in `.well-known/oauth-protected-resource` is consumed by both interactive clients (authorization code) and machine-to-machine clients (`client_credentials`). Those flows can need different IdP scope formats. When a `client_credentials` override is required, document the correct `MCP_CC_PROXY_SCOPES` value in your setup instructions.
+Expect most OAuth-protected MCP servers to serve **both** interactive clients (authorization code + user consent) and M2M clients (this proxy / `client_credentials`). One Protected Resource Metadata document is shared; the tension is scope policy and IdP grants, not two different MCP protocols.
 
-### Recommended approach
+This proxy targets end users with minimal config: ideally remote URL, `client_id`, and `client_secret` only. Design discovery and M2M credential issuance so that path works without `MCP_CC_PROXY_SCOPES`.
 
-List **granular, application-level scopes** in `scopes_supported` (works for interactive clients and most IdPs):
+### Dual interactive + M2M rules
+
+1. **Publish one PRM** with granular, application-level scopes in `scopes_supported`. Per [MCP Authorization](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization), treat that list as the **baseline for basic functionality**; optional or higher-privilege scopes can be added later via step-up.
 
 ```json
 {
   "resource": "https://mcp.example.com/mcp",
   "authorization_servers": ["https://auth.example.com"],
-  "scopes_supported": ["inventory.read", "orders.write", "orders.read"]
+  "scopes_supported": ["inventory.read", "orders.read"]
 }
 ```
 
-List every scope your server uses so clients can request the full set on initial token acquisition and avoid per-operation 403 challenges (see [Known Issues](#known-issues)). Machine-to-machine clients whose IdP needs a different format override via `MCP_CC_PROXY_SCOPES` without changing server metadata.
+2. **Use separate OAuth clients** for interactive apps vs service accounts, but the **same resource / audience**. Interactive consent and M2M client grants are different IdP objects; do not assume a user-consent app registration works as a service account for this proxy.
+
+3. **Align M2M grants with discovery.** This proxy (and similar M2M clients) will request the full discovered `scopes_supported` string at startup unless overridden. When you issue a service account / M2M client (or document self-serve setup), grant it at least that baseline. On strict IdPs, a mismatch means this proxy cannot start; on silent-dropping IdPs it starts with a weak token and fails later. End users should not need to hand-edit scopes for a normal install.
+
+4. **Step-up is shared protocol, different UX.** Return `403` + `insufficient_scope` + `scope=` when an operation needs more than the current token (not `401`/`invalid_token` for "missing scope"). Interactive clients can re-consent; M2M step-up only succeeds for scopes the **service account is already allowed** at the IdP. Pre-grant any scopes you expect M2M clients to obtain via step-up, or keep those operations out of the M2M product surface.
+
+5. **If `scopes_supported` lists every advanced scope** (not only the baseline), M2M credentials must be granted that full set (or a documented tier that matches a published subset). Putting "everything" in PRM is fine for interactive least-privilege-via-consent only if M2M issuance matches; otherwise zero-config M2M breaks on strict IdPs.
+
+6. **Document `MCP_CC_PROXY_SCOPES` only as an escape hatch:** IdP needs a different M2M scope format (Entra `.default`), MCP Authorization discovery is unavailable, or you intentionally publish a baseline that M2M clients must override. Do not rely on end users to invent scope lists.
 
 ### Entra ID (Azure AD) compatibility
 
-Entra ID requires `{resource}/.default` for `client_credentials` and rejects individual scope names. `scopes_supported` cannot usefully hold both granular scopes (authorization code) and `.default` (`client_credentials`), so the override is the intended solution:
+This is the common **format** clash for dual-flow servers: Entra requires `{resource}/.default` for `client_credentials` and rejects individual scope names, while interactive clients still want granular scopes in `scopes_supported`. Document the M2M override in your user setup:
 
 ```jsonc
 // MCP client config for Entra ID
@@ -312,7 +325,7 @@ The MCP TypeScript SDK has known bugs around scope step-up (403 `insufficient_sc
 
 **This proxy works around both for Streamable HTTP:** on `403` with `WWW-Authenticate` `error="insufficient_scope"` and a `scope` parameter, it merges the challenge into its running scope set, acquires a new token with the full union, retries once, and logs on stderr (`Scope step-up challenge received…` / `Scope step-up token acquired`). Later calls that need more scopes expand the same set (when the IdP grants them). If the IdP rejects the stepped-up scopes, the proxy keeps the previous scopes and access token, returns the original `403`, and stays usable for other requests.
 
-Prefer listing every scope in `scopes_supported` / `MCP_CC_PROXY_SCOPES` so step-up is unnecessary.
+Step-up is a runtime safety net when discovery (or a documented override) produced a valid starting token and the remote later challenges for more scopes the IdP will grant that client. For dual-flow servers, that means M2M step-up only works inside pre-granted service-account scopes; it is not a substitute for aligning `scopes_supported` with M2M credential issuance. A strict IdP rejecting the discovered set at startup is a server/provider configuration problem.
 
 **Not covered:** some servers (including some FastMCP paths) return `401` + `invalid_token` for missing scopes instead of `403` + `insufficient_scope`. That cannot be stepped up reliably; restart the proxy after required-scope policy changes. See [OAuth discovery and scopes are fixed at startup](#oauth-discovery-and-scopes-are-fixed-at-startup).
 
