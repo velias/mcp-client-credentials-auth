@@ -974,4 +974,89 @@ describe('TokenManager', () => {
       expect(() => tm.invalidate()).not.toThrow();
     });
   });
+
+  describe('stepUpScopes', () => {
+    it('mutates clientMetadata.scope, calls auth, and stores a usable token', async () => {
+      setupAuthenticatedDiscovery();
+      mockAuth.mockImplementation(async (provider) => {
+        await Promise.resolve(provider.saveTokens({
+          access_token: 'step-up-token',
+          token_type: 'bearer',
+          expires_in: 3600,
+        }));
+        return 'AUTHORIZED';
+      });
+
+      const logger = createMockLogger();
+      const tm = createTokenManager(createTestConfig(), logger);
+      await tm.discover();
+
+      await tm.stepUpScopes('email');
+
+      const provider = tm.getAuthProvider() as {
+        clientMetadata: { scope?: string };
+        tokens: () => { access_token?: string } | undefined;
+      };
+      expect(provider.clientMetadata.scope).toBe('read write email');
+      expect(tm.getCurrentScopes()).toBe('read write email');
+      expect(tm.getAccessToken()).toBe('step-up-token');
+      expect(mockAuth).toHaveBeenCalled();
+    });
+
+    it('accumulates scopes across sequential step-ups (does not overwrite)', async () => {
+      setupAuthenticatedDiscovery();
+      mockAuth.mockImplementation(async (provider) => {
+        await Promise.resolve(provider.saveTokens({
+          access_token: 'tok',
+          token_type: 'bearer',
+          expires_in: 3600,
+        }));
+        return 'AUTHORIZED';
+      });
+
+      const tm = createTokenManager(createTestConfig(), createMockLogger());
+      await tm.discover();
+
+      await tm.stepUpScopes('email');
+      await tm.stepUpScopes('orders.write');
+
+      const provider = tm.getAuthProvider() as { clientMetadata: { scope?: string } };
+      expect(provider.clientMetadata.scope).toBe('read write email orders.write');
+      expect(tm.getCurrentScopes()).toBe('read write email orders.write');
+    });
+
+    it('coalesces concurrent step-ups into one in-flight acquisition covering merged scopes', async () => {
+      setupAuthenticatedDiscovery();
+      let authCalls = 0;
+      mockAuth.mockImplementation(async (provider) => {
+        authCalls++;
+        await Promise.resolve();
+        await Promise.resolve(provider.saveTokens({
+          access_token: `tok-${authCalls}`,
+          token_type: 'bearer',
+          expires_in: 3600,
+        }));
+        return 'AUTHORIZED';
+      });
+
+      const tm = createTokenManager(createTestConfig(), createMockLogger());
+      await tm.discover();
+
+      await Promise.all([tm.stepUpScopes('email'), tm.stepUpScopes('orders.write')]);
+
+      const provider = tm.getAuthProvider() as { clientMetadata: { scope?: string } };
+      expect(provider.clientMetadata.scope).toBe('read write email orders.write');
+      // First auth may race before the second merge; a second pass covers remaining scopes.
+      expect(authCalls).toBeGreaterThanOrEqual(1);
+      expect(authCalls).toBeLessThanOrEqual(2);
+      expect(tm.getAccessToken()).toBeTruthy();
+    });
+
+    it('returns a step-up fetch wrapper when authenticated', async () => {
+      setupAuthenticatedDiscovery();
+      const tm = createTokenManager(createTestConfig(), createMockLogger());
+      await tm.discover();
+      expect(typeof tm.getScopeStepUpFetch()).toBe('function');
+    });
+  });
 });

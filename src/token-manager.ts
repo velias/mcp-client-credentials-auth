@@ -13,6 +13,7 @@ import type {
   OAuthTokens,
   AuthorizationServerMetadata,
 } from '@modelcontextprotocol/sdk/shared/auth.js';
+import type { FetchLike } from '@modelcontextprotocol/sdk/shared/transport.js';
 import type { Config } from './config.js';
 import {
   errorDetail,
@@ -21,6 +22,7 @@ import {
   isPermanentOAuthConfigError,
 } from './errors.js';
 import type { Logger } from './logger.js';
+import { createScopeStepUpFetch, mergeOAuthScopes } from './scope-step-up.js';
 
 export type AuthMode =
   | { type: 'authenticated'; provider: ClientCredentialsProvider }
@@ -35,6 +37,10 @@ export interface TokenManager {
   hasUsableAccessToken(): boolean;
   getAuthProvider(): OAuthClientProvider | undefined;
   getAuthMode(): AuthMode;
+  getAccessToken(): string | undefined;
+  getCurrentScopes(): string | undefined;
+  stepUpScopes(challengeScopes: string): Promise<void>;
+  getScopeStepUpFetch(): FetchLike;
   invalidate(): void;
   stop(): void;
 }
@@ -94,6 +100,7 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
   let authServerMetadata: AuthorizationServerMetadata | undefined;
   let refreshTimer: ReturnType<typeof setTimeout> | undefined;
   let inflightRefresh: Promise<void> | undefined;
+  let inflightStepUp: Promise<void> | undefined;
 
   const timeoutFetch: typeof globalThis.fetch = (input, init) => {
     const signal = config.requestTimeoutMs
@@ -324,6 +331,79 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
     return typeof tokens?.access_token === 'string' && tokens.access_token.length > 0;
   }
 
+  function getAccessToken(): string | undefined {
+    if (authMode.type !== 'authenticated' || !provider) {
+      return undefined;
+    }
+    const token = provider.tokens()?.access_token;
+    return typeof token === 'string' && token.length > 0 ? token : undefined;
+  }
+
+  function getCurrentScopes(): string | undefined {
+    return currentScopes;
+  }
+
+  /**
+   * Accumulate challenge scopes into the live provider metadata and acquire a new token.
+   * Concurrent callers share one in-flight acquisition; scopes merged during the flight
+   * trigger another auth pass so the final token includes the full union.
+   */
+  async function stepUpScopes(challengeScopes: string): Promise<void> {
+    if (authMode.type !== 'authenticated' || !provider) {
+      throw new Error(
+        formatProxyError('authentication', 'Cannot step up scopes: proxy is not authenticated'),
+      );
+    }
+
+    currentScopes = mergeOAuthScopes(currentScopes, challengeScopes);
+    provider.clientMetadata.scope = currentScopes;
+
+    if (!inflightStepUp) {
+      inflightStepUp = (async () => {
+        try {
+          let scopesSnapshot: string | undefined;
+          do {
+            if (!provider) {
+              throw new Error(
+                formatProxyError('authentication', 'Cannot step up scopes: provider missing'),
+              );
+            }
+            scopesSnapshot = currentScopes;
+            provider.clientMetadata.scope = scopesSnapshot;
+            // Clear the cached token so auth() fetches with the updated clientMetadata.scope.
+            provider.saveTokens({ access_token: '', token_type: 'bearer' });
+            const result = await auth(provider, {
+              serverUrl: config.remoteMcpUrl,
+              fetchFn: timeoutFetch,
+            });
+            if (result !== 'AUTHORIZED') {
+              throw new Error(
+                formatProxyError('authentication', 'Scope step-up auth did not authorize'),
+              );
+            }
+          } while (scopesSnapshot !== currentScopes);
+        } finally {
+          inflightStepUp = undefined;
+        }
+      })();
+    }
+
+    await inflightStepUp;
+  }
+
+  function getScopeStepUpFetch(): FetchLike {
+    if (authMode.type !== 'authenticated' || !provider) {
+      return fetch;
+    }
+    return createScopeStepUpFetch({
+      // Use global fetch (not timeoutFetch): Streamable HTTP also uses this for long-lived SSE.
+      getAccessToken,
+      getCurrentScopes,
+      stepUp: stepUpScopes,
+      logger,
+    });
+  }
+
   async function waitUntilAuthReady(deadlineMs: number): Promise<void> {
     let attempt = 0;
     while (true) {
@@ -421,6 +501,10 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
     hasUsableAccessToken,
     getAuthProvider,
     getAuthMode,
+    getAccessToken,
+    getCurrentScopes,
+    stepUpScopes,
+    getScopeStepUpFetch,
     invalidate,
     stop,
   };
