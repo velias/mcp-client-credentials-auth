@@ -1,12 +1,15 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import type { OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
+import type { FetchLike } from '@modelcontextprotocol/sdk/shared/transport.js';
 import type { ClientCapabilities, Implementation, ServerCapabilities } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod/v3';
+import { getBackoffDelay, sleep } from './backoff.js';
 import type { Config } from './config.js';
 import {
   PROXY_NAME,
@@ -78,14 +81,62 @@ function shouldFallbackToSse(err: unknown): boolean {
   return classifyError(err) === 'connection';
 }
 
-export interface ProxyHandle {
-  close(): Promise<void>;
+/**
+ * Connect via Streamable HTTP; on connection-class failure only, fall back to SSE.
+ * Both transports share the same authProvider; Streamable HTTP may use a custom fetch.
+ */
+async function connectWithTransportFallback(
+  client: Client,
+  remoteUrl: URL,
+  options: {
+    authProvider: OAuthClientProvider | undefined;
+    fetch?: FetchLike;
+    logger: Logger;
+    /** Distinguishes discovery vs runtime log wording (tests assert these strings). */
+    phase: 'discovery' | 'runtime';
+    clientName?: string;
+  },
+): Promise<void> {
+  const { authProvider, logger, phase, clientName } = options;
+  const meta = clientName !== undefined ? { clientName } : undefined;
+  const msgs =
+    phase === 'discovery'
+      ? {
+          streamableOk: 'Discovery: connected via Streamable HTTP',
+          noSse: 'Streamable HTTP connection failed, not trying SSE fallback',
+          trySse: 'Streamable HTTP connection failed, trying SSE fallback',
+          sseOk: 'Discovery: connected to remote MCP server via SSE',
+        }
+      : {
+          streamableOk: 'Connected to remote MCP server via Streamable HTTP',
+          noSse: 'Streamable HTTP failed, not trying SSE fallback',
+          trySse: 'Streamable HTTP failed, trying SSE fallback',
+          sseOk: 'Connected to remote MCP server via SSE',
+        };
+
+  try {
+    const httpTransport = new StreamableHTTPClientTransport(remoteUrl, {
+      authProvider,
+      ...(options.fetch ? { fetch: options.fetch } : {}),
+    });
+    await client.connect(httpTransport);
+    logger.info(msgs.streamableOk, meta);
+  } catch (httpErr) {
+    const detail = errorDetail(httpErr);
+    const category = classifyError(httpErr);
+    if (!shouldFallbackToSse(httpErr)) {
+      logger.warn(msgs.noSse, { category, error: detail });
+      throw httpErr;
+    }
+    logger.warn(msgs.trySse, { category, error: detail });
+    const sseTransport = new SSEClientTransport(remoteUrl, { authProvider });
+    await client.connect(sseTransport);
+    logger.info(msgs.sseOk, meta);
+  }
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
+export interface ProxyHandle {
+  close(): Promise<void>;
 }
 
 export async function createProxy(
@@ -108,39 +159,17 @@ export async function createProxy(
     capabilities: ServerCapabilities;
     serverInfo: Implementation | undefined;
   }> {
-    const authProvider = tokenManager.getAuthProvider();
     const discoveryClient = new Client(
       { name: PROXY_NAME, version: PKG_VERSION },
       { capabilities: withClientCredentialsExtension({}) },
     );
 
-    try {
-      const httpTransport = new StreamableHTTPClientTransport(remoteUrl, {
-        authProvider,
-        fetch: tokenManager.getScopeStepUpFetch(),
-      });
-      await discoveryClient.connect(httpTransport);
-      logger.info('Discovery: connected via Streamable HTTP');
-    } catch (httpErr) {
-      const detail = errorDetail(httpErr);
-      const category = classifyError(httpErr);
-      if (!shouldFallbackToSse(httpErr)) {
-        logger.warn('Streamable HTTP connection failed, not trying SSE fallback', {
-          category,
-          error: detail,
-        });
-        throw httpErr;
-      }
-      logger.warn('Streamable HTTP connection failed, trying SSE fallback', {
-        category,
-        error: detail,
-      });
-      const sseTransport = new SSEClientTransport(remoteUrl, {
-        authProvider,
-      });
-      await discoveryClient.connect(sseTransport);
-      logger.info('Discovery: connected to remote MCP server via SSE');
-    }
+    await connectWithTransportFallback(discoveryClient, remoteUrl, {
+      authProvider: tokenManager.getAuthProvider(),
+      fetch: tokenManager.getScopeStepUpFetch(),
+      logger,
+      phase: 'discovery',
+    });
 
     const capabilities = discoveryClient.getServerCapabilities() ?? {};
     const serverInfo = discoveryClient.getServerVersion();
@@ -181,9 +210,10 @@ export async function createProxy(
           { cause: err },
         );
       }
-      const exponential = Math.min(PHASE1_RETRY_BASE_MS * 2 ** phase1Attempt, PHASE1_RETRY_MAX_MS);
-      const jitter = Math.random() * exponential * 0.3;
-      const delayMs = Math.min(Math.round(exponential + jitter), remaining);
+      const delayMs = Math.min(
+        getBackoffDelay(phase1Attempt, PHASE1_RETRY_BASE_MS, PHASE1_RETRY_MAX_MS),
+        remaining,
+      );
       logger.warn('Remote MCP server unreachable during discovery, retrying', {
         category,
         error: detail,
@@ -211,43 +241,18 @@ export async function createProxy(
     identity: Implementation,
     capabilities: ClientCapabilities,
   ): Promise<Client> {
-    const authProvider = tokenManager.getAuthProvider();
     logger.debug('Connecting to remote MCP server', { clientName: identity.name });
     const client = new Client(identity, {
       capabilities: withClientCredentialsExtension(capabilities),
     });
 
-    try {
-      const httpTransport = new StreamableHTTPClientTransport(remoteUrl, {
-        authProvider,
-        fetch: tokenManager.getScopeStepUpFetch(),
-      });
-      await client.connect(httpTransport);
-      logger.info('Connected to remote MCP server via Streamable HTTP', {
-        clientName: identity.name,
-      });
-    } catch (httpErr) {
-      const detail = errorDetail(httpErr);
-      const category = classifyError(httpErr);
-      if (!shouldFallbackToSse(httpErr)) {
-        logger.warn('Streamable HTTP failed, not trying SSE fallback', {
-          category,
-          error: detail,
-        });
-        throw httpErr;
-      }
-      logger.warn('Streamable HTTP failed, trying SSE fallback', {
-        category,
-        error: detail,
-      });
-      const sseTransport = new SSEClientTransport(remoteUrl, {
-        authProvider,
-      });
-      await client.connect(sseTransport);
-      logger.info('Connected to remote MCP server via SSE', {
-        clientName: identity.name,
-      });
-    }
+    await connectWithTransportFallback(client, remoteUrl, {
+      authProvider: tokenManager.getAuthProvider(),
+      fetch: tokenManager.getScopeStepUpFetch(),
+      logger,
+      phase: 'runtime',
+      clientName: identity.name,
+    });
 
     return client;
   }
@@ -309,12 +314,6 @@ export async function createProxy(
   const RECONNECT_BASE_MS = 1000;
   const RECONNECT_MAX_MS = 60000;
   const RECONNECT_STABLE_THRESHOLD_MS = 30000;
-
-  function getReconnectDelay(): number {
-    const exponential = Math.min(RECONNECT_BASE_MS * 2 ** reconnectAttempt, RECONNECT_MAX_MS);
-    const jitter = Math.random() * exponential * 0.3;
-    return Math.round(exponential + jitter);
-  }
 
   function scheduleReconnect(): Promise<void> {
     if (!reconnectPromise) {
@@ -383,7 +382,7 @@ export async function createProxy(
     }
 
     if (reconnectAttempt > 0) {
-      const delayMs = getReconnectDelay();
+      const delayMs = getBackoffDelay(reconnectAttempt, RECONNECT_BASE_MS, RECONNECT_MAX_MS);
       logger.info('Scheduling reconnection attempt', {
         attempt: reconnectAttempt + 1,
         delayMs,

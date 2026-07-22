@@ -14,6 +14,7 @@ import type {
   AuthorizationServerMetadata,
 } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { FetchLike } from '@modelcontextprotocol/sdk/shared/transport.js';
+import { getBackoffDelay, sleep } from './backoff.js';
 import type { Config } from './config.js';
 import {
   errorDetail,
@@ -47,18 +48,6 @@ export interface TokenManager {
 
 const AUTH_RETRY_BASE_MS = 5000;
 const AUTH_RETRY_MAX_MS = 60000;
-
-function getBackoffDelay(attempt: number, baseMs: number, maxMs: number): number {
-  const exponential = Math.min(baseMs * 2 ** attempt, maxMs);
-  const jitter = Math.random() * exponential * 0.3;
-  return Math.round(exponential + jitter);
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
-}
 
 function seedManualDiscoveryState(
   provider: ClientCredentialsProvider,
@@ -343,10 +332,33 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
     return currentScopes;
   }
 
+  function snapshotTokens(tokens: OAuthTokens | undefined): OAuthTokens | undefined {
+    return tokens ? { ...tokens } : undefined;
+  }
+
+  function restoreScopesAndTokens(
+    scopes: string | undefined,
+    tokens: OAuthTokens | undefined,
+  ): void {
+    currentScopes = scopes;
+    if (!provider) return;
+    provider.clientMetadata.scope = scopes;
+    // Restore the prior token (or clear) so a failed step-up cannot leave auth unusable.
+    provider.saveTokens(
+      tokens && tokens.access_token
+        ? tokens
+        : { access_token: '', token_type: 'bearer' },
+    );
+  }
+
   /**
    * Accumulate challenge scopes into the live provider metadata and acquire a new token.
    * Concurrent callers share one in-flight acquisition; scopes merged during the flight
    * trigger another auth pass so the final token includes the full union.
+   *
+   * Scopes/tokens commit only after a successful auth(). On failure, the pre-flight
+   * baseline is restored so a bad insufficient_scope challenge cannot poison scopes
+   * or wipe a working access token.
    */
   async function stepUpScopes(challengeScopes: string): Promise<void> {
     if (authMode.type !== 'authenticated' || !provider) {
@@ -355,10 +367,13 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
       );
     }
 
-    currentScopes = mergeOAuthScopes(currentScopes, challengeScopes);
-    provider.clientMetadata.scope = currentScopes;
+    const startingNewFlight = !inflightStepUp;
+    const baselineScopes = startingNewFlight ? currentScopes : undefined;
+    const baselineTokens = startingNewFlight ? snapshotTokens(provider.tokens()) : undefined;
 
-    if (!inflightStepUp) {
+    currentScopes = mergeOAuthScopes(currentScopes, challengeScopes);
+
+    if (startingNewFlight) {
       inflightStepUp = (async () => {
         try {
           let scopesSnapshot: string | undefined;
@@ -372,14 +387,19 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
             provider.clientMetadata.scope = scopesSnapshot;
             // Clear the cached token so auth() fetches with the updated clientMetadata.scope.
             provider.saveTokens({ access_token: '', token_type: 'bearer' });
-            const result = await auth(provider, {
-              serverUrl: config.remoteMcpUrl,
-              fetchFn: timeoutFetch,
-            });
-            if (result !== 'AUTHORIZED') {
-              throw new Error(
-                formatProxyError('authentication', 'Scope step-up auth did not authorize'),
-              );
+            try {
+              const result = await auth(provider, {
+                serverUrl: config.remoteMcpUrl,
+                fetchFn: timeoutFetch,
+              });
+              if (result !== 'AUTHORIZED') {
+                throw new Error(
+                  formatProxyError('authentication', 'Scope step-up auth did not authorize'),
+                );
+              }
+            } catch (err) {
+              restoreScopesAndTokens(baselineScopes, baselineTokens);
+              throw err;
             }
           } while (scopesSnapshot !== currentScopes);
         } finally {
