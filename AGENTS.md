@@ -21,12 +21,14 @@ src/
   config.ts            # MCP_CC_PROXY_* env var loading, zod validation
   errors.ts            # Proxy error categories, formatting, client-facing McpError wrap
   logger.ts            # Structured stderr logger (key=value, no deps)
-  token-manager.ts     # OAuth discovery, client_credentials, cache, refresh
+  token-manager.ts     # OAuth discovery, client_credentials, cache, refresh, scope step-up
+  scope-step-up.ts     # 403 insufficient_scope fetch workaround (SDK #2255/#1582); remove when fixed upstream
   proxy.ts             # Wire local Server <-> remote Client
 test/
   config.test.ts           # Config parsing, validation, defaults, scope override
   errors.test.ts           # Error classification and mcp-client-credentials-auth [category] format
-  token-manager.test.ts    # Discovery, auth modes, scope resolution, prefetch, proactive refresh
+  token-manager.test.ts    # Discovery, auth modes, scope resolution, prefetch, proactive refresh, step-up
+  scope-step-up.test.ts    # Scope merge + step-up fetch wrapper
   proxy.test.ts            # E2E with in-memory MCP transports, reconnection
   proxy-advanced.test.ts   # Auth usability gating, remote error wrapping, polling
   proxy-resilience.test.ts # Fail-closed Phase 1 startup, Phase 3 reconnect, dynamic auth
@@ -42,6 +44,7 @@ test/
 - **No hardcoded method tables** -- all 4 message flows use `fallbackRequestHandler`/`fallbackNotificationHandler`
 - **`_meta` sanitization** -- auth-like keys stripped from all client-to-server messages (requests and notifications) before forwarding to remote
 - **Transport fallback** -- Streamable HTTP first, SSE only for `connection`-class failures (skip SSE on `authentication` / `remote`; both transports share the same authProvider)
+- **Scope step-up workaround** -- Streamable HTTP uses a custom `fetch` (`scope-step-up.ts` via `tokenManager.getScopeStepUpFetch()`) that intercepts `403` + `insufficient_scope` + `scope=`, merges scopes into the live `ClientCredentialsProvider.clientMetadata.scope`, reacquires a token, and retries once (avoids SDK #2255/#1582). Remove when both issues are fixed upstream (see upgrade checklist).
 - **Automatic reconnection** -- after startup, detects remote `onclose`, Phase 3 connection failure, or stale Streamable HTTP session (spec HTTP 404 / session-loss message without `onclose`), reconnects indefinitely with exponential backoff (1s--60s with jitter), restarts polling; backoff resets after a connection is stable for 30s. Stale-session recovery invalidates the old client, coalesces concurrent recoveries, retries the failed request once, and logs WARN `Remote Streamable HTTP session lost, recreating session` then INFO `Remote Streamable HTTP session reacquired`. Requests get `connection` errors while `!remoteClient`.
 - **Runtime auth gaps** -- if auth is required and `hasUsableAccessToken()` is false, requests get a short `authentication` MCP error (`no usable access token`); proactive refresh keeps retrying in the background (no process exit)
 - **Manual token endpoint** -- optional `MCP_CC_PROXY_TOKEN_ENDPOINT` skips MCP Authorization discovery (RFC 9728 / RFC 8414); seeds `ClientCredentialsProvider` with `discoveryState` / `validateResourceURL` so SDK `auth()` hits the configured token URL. Scopes come only from `MCP_CC_PROXY_SCOPES` in this mode. Startup still requires a successful prefetch within the shared startup deadline.
@@ -112,8 +115,9 @@ When bumping `@modelcontextprotocol/sdk`, check the following areas where the pr
 
 ### Transport layer (`proxy.ts`)
 
-- **`StreamableHTTPClientTransport` options** -- we pass `{ authProvider }`. We intentionally do NOT pass `requestInit.signal` because a transport-level `AbortSignal.timeout` goes stale after firing and breaks all subsequent requests. Per-request timeouts are handled via the SDK's `{ timeout }` option instead.
-- **`SSEClientTransport` options** -- same pattern with `authProvider` only.
+- **`StreamableHTTPClientTransport` options** -- we pass `{ authProvider, fetch: tokenManager.getScopeStepUpFetch() }`. The custom `fetch` must remain global `fetch` (not `timeoutFetch`) so long-lived SSE GETs are not aborted by `AbortSignal.timeout`. We intentionally do NOT pass `requestInit.signal`. Per-request MCP timeouts use the SDK `{ timeout }` option.
+- **`SSEClientTransport` options** -- `{ authProvider }` only (no scope step-up fetch; SSE has no equivalent upscoping path).
+- **Scope step-up removal** -- when [#2255](https://github.com/modelcontextprotocol/typescript-sdk/issues/2255) and [#1582](https://github.com/modelcontextprotocol/typescript-sdk/issues/1582) are both fixed in a released SDK: delete `src/scope-step-up.ts` and its tests, remove `stepUpScopes` / `getScopeStepUpFetch` from `token-manager.ts`, drop the `fetch:` option in `proxy.ts`, and update README Known Issues.
 - **`Client.onclose`** -- we rely on `onclose` firing when the remote transport disconnects. If the SDK changes to an event emitter or renames this, reconnection breaks.
 - **`Client.connect()` re-entrancy** -- we create a new `Client` instance for each reconnection. Verify the SDK doesn't introduce singleton restrictions or session ID reuse that would prevent this.
 - **401 retry behavior** -- the SDK's transport handles 401 responses by calling `auth()` internally. Our proactive refresh reduces how often this path is hit, but if the SDK removes automatic 401 retry, requests will fail when proactive refresh is late.
@@ -132,7 +136,7 @@ When bumping `@modelcontextprotocol/sdk`, check the following areas where the pr
 
 ### Known SDK issues to re-check
 
-- **Scope step-up bugs** ([#1582](https://github.com/modelcontextprotocol/typescript-sdk/issues/1582), [#2255](https://github.com/modelcontextprotocol/typescript-sdk/issues/2255)) -- if fixed upstream, we can remove the "Known Issues" section from README and potentially remove the workaround note.
+- **Scope step-up bugs** ([#1582](https://github.com/modelcontextprotocol/typescript-sdk/issues/1582), [#2255](https://github.com/modelcontextprotocol/typescript-sdk/issues/2255)) -- this repo ships a Streamable HTTP fetch workaround. When **both** are fixed upstream, remove the workaround (see transport checklist bullet) and trim README Known Issues.
 - **`SSEClientTransport` deprecation** -- the SDK marks it deprecated. If removed entirely, delete our SSE fallback code.
 
 ### How to verify

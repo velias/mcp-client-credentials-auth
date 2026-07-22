@@ -99,6 +99,10 @@ function createMockTokenManager(
     hasUsableAccessToken: vi.fn().mockReturnValue(hasToken),
     getAuthProvider: vi.fn().mockReturnValue(mode.type === 'authenticated' ? {} : undefined),
     getAuthMode: vi.fn().mockReturnValue(mode),
+    getAccessToken: vi.fn().mockReturnValue(undefined),
+    getCurrentScopes: vi.fn().mockReturnValue(undefined),
+    stepUpScopes: vi.fn().mockResolvedValue(undefined),
+    getScopeStepUpFetch: vi.fn().mockReturnValue(fetch),
     invalidate: vi.fn(),
     stop: vi.fn(),
   };

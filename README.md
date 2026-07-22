@@ -340,16 +340,28 @@ No configuration is needed; the real client name is introspected from the MCP ha
 
 ## Known Issues
 
-### Scope step-up does not work reliably with `client_credentials`
+### Scope step-up and the MCP TypeScript SDK
 
 The MCP TypeScript SDK has known bugs around scope step-up (403 `insufficient_scope` handling):
 
 1. **Scope overwrite instead of accumulation** ([typescript-sdk#1582](https://github.com/modelcontextprotocol/typescript-sdk/issues/1582)): when multiple operations require different scopes, the transport overwrites the active scope instead of merging, causing infinite re-authorization loops.
-2. **`fetchToken` ignores challenge scope** ([typescript-sdk#2255](https://github.com/modelcontextprotocol/typescript-sdk/issues/2255)): for `client_credentials` grants, `fetchToken()` reads the scope from the provider's immutable `clientMetadata.scope` rather than the scope extracted from the `WWW-Authenticate` header. A 403 challenge with a new scope never actually reaches the token endpoint.
+2. **`fetchToken` ignores challenge scope** ([typescript-sdk#2255](https://github.com/modelcontextprotocol/typescript-sdk/issues/2255)): for `client_credentials` grants, `fetchToken()` reads the scope from the provider's `clientMetadata.scope` rather than the scope extracted from the `WWW-Authenticate` header. A 403 challenge with a new scope never actually reaches the token endpoint.
 
-These are upstream SDK issues with open PRs, but no released fix as of SDK v1.x.
+**This proxy works around both for Streamable HTTP:** when the remote server returns `403` with `WWW-Authenticate` `error="insufficient_scope"` and a `scope` parameter, the proxy merges that challenge into its running scope set, acquires a new access token with the full union, retries the request once, and logs the step-up on stderr (`Scope step-up challenge received…` / `Scope step-up token acquired`). Later tool calls that require additional scopes expand the same set, so the token stays valid for all scopes collected so far (assuming the IdP grants them).
 
-**Workaround:** List all scopes your server uses in `scopes_supported` so the full set is requested on initial token acquisition and no per-operation 403 challenges occur. See [Announce all required scopes](#announce-all-required-scopes) for details.
+Still prefer listing every scope in `scopes_supported` / `MCP_CC_PROXY_SCOPES` so step-up is unnecessary. See [Announce all required scopes](#announce-all-required-scopes).
+
+**Not covered:** some servers (including some FastMCP paths) return `401` + `invalid_token` for missing scopes instead of `403` + `insufficient_scope`. That cannot be stepped up reliably; restart the proxy after required-scope policy changes. See [OAuth discovery and scopes are fixed at startup](#oauth-discovery-and-scopes-are-fixed-at-startup).
+
+#### When the SDK is patched
+
+On each `@modelcontextprotocol/sdk` bump, re-check [#2255](https://github.com/modelcontextprotocol/typescript-sdk/issues/2255) and [#1582](https://github.com/modelcontextprotocol/typescript-sdk/issues/1582) (or the release notes). When **both** are fixed in the released SDK:
+
+1. Remove [`src/scope-step-up.ts`](src/scope-step-up.ts), `stepUpScopes` / `getScopeStepUpFetch` from the token manager, and the `fetch:` option passed to `StreamableHTTPClientTransport` in the proxy.
+2. Delete [`test/scope-step-up.test.ts`](test/scope-step-up.test.ts) (and related token-manager step-up tests).
+3. Drop this workaround section from the README / AGENTS upgrade checklist, keeping only a short note if useful.
+
+Until then, keep the workaround. It remains safe if the SDK is only partially fixed: the custom fetch returns success after retry, so the transport never enters its own upscoping branch for that response. Verify with unit tests and a manual 403 challenge against a test MCP server.
 
 ## Contributing
 

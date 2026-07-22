@@ -117,6 +117,7 @@ export async function createProxy(
     try {
       const httpTransport = new StreamableHTTPClientTransport(remoteUrl, {
         authProvider,
+        fetch: tokenManager.getScopeStepUpFetch(),
       });
       await discoveryClient.connect(httpTransport);
       logger.info('Discovery: connected via Streamable HTTP');
@@ -219,6 +220,7 @@ export async function createProxy(
     try {
       const httpTransport = new StreamableHTTPClientTransport(remoteUrl, {
         authProvider,
+        fetch: tokenManager.getScopeStepUpFetch(),
       });
       await client.connect(httpTransport);
       logger.info('Connected to remote MCP server via Streamable HTTP', {
