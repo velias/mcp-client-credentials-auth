@@ -1,238 +1,58 @@
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
-import type { OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
-import type { FetchLike } from '@modelcontextprotocol/sdk/shared/transport.js';
 import type { ClientCapabilities, Implementation, ServerCapabilities } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod/v3';
-import { getBackoffDelay, sleep } from './backoff.js';
+import { getBackoffDelay } from './backoff.js';
 import type { Config } from './config.js';
 import {
   PROXY_NAME,
   classifyError,
   errorDetail,
-  formatUnrecoverableOAuthMisconfig,
   isStaleRemoteSessionError,
-  resolveUnrecoverableStartupAuthSource,
   toClientError,
   wrapCaughtError,
 } from './errors.js';
 import type { Logger } from './logger.js';
+import { connectWithTransportFallback } from './remote-connect.js';
 import type { TokenManager } from './token-manager.js';
-
-const pkg = JSON.parse(
-  readFileSync(resolve(__dirname, '..', 'package.json'), 'utf-8'),
-) as { version: string };
-export const PKG_VERSION = pkg.version;
-const CLIENT_CREDENTIALS_EXTENSION = 'io.modelcontextprotocol/oauth-client-credentials';
+import {
+  PKG_VERSION,
+  buildClientIdentity,
+  sanitizeMeta,
+  withClientCredentialsExtension,
+} from './proxy-utils.js';
 
 const permissiveSchema = z.object({}).passthrough();
 
-const AUTH_META_KEYS = new Set([
-  'authorization',
-  'token',
-  'bearer',
-  'access_token',
-  'client_secret',
-]);
-
-function sanitizeMeta(
-  params: Record<string, unknown> | undefined,
-): Record<string, unknown> | undefined {
-  if (!params) return params;
-  const meta = params._meta;
-  if (!meta || typeof meta !== 'object') return params;
-
-  const sanitized: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(meta as Record<string, unknown>)) {
-    if (!AUTH_META_KEYS.has(key.toLowerCase())) {
-      sanitized[key] = value;
-    }
-  }
-  return { ...params, _meta: sanitized };
-}
-
-function withClientCredentialsExtension(capabilities: ClientCapabilities): ClientCapabilities {
-  return {
-    ...capabilities,
-    extensions: {
-      ...capabilities.extensions,
-      [CLIENT_CREDENTIALS_EXTENSION]: {},
-    },
-  };
-}
-
-function buildClientIdentity(localClientInfo: Implementation | undefined): Implementation {
-  if (localClientInfo?.name) {
-    return {
-      name: `${localClientInfo.name} via ${PROXY_NAME} v${PKG_VERSION}`,
-      version: localClientInfo.version ?? '',
-    };
-  }
-  return { name: PROXY_NAME, version: PKG_VERSION };
-}
-
-/** SSE uses the same authProvider; only retry on transport-shaped failures. */
-function shouldFallbackToSse(err: unknown): boolean {
-  return classifyError(err) === 'connection';
-}
-
-/**
- * Connect via Streamable HTTP; on connection-class failure only, fall back to SSE.
- * Both transports share the same authProvider; Streamable HTTP may use a custom fetch.
- */
-async function connectWithTransportFallback(
-  client: Client,
-  remoteUrl: URL,
-  options: {
-    authProvider: OAuthClientProvider | undefined;
-    fetch?: FetchLike;
-    logger: Logger;
-    /** Distinguishes discovery vs runtime log wording (tests assert these strings). */
-    phase: 'discovery' | 'runtime';
-    clientName?: string;
-  },
-): Promise<void> {
-  const { authProvider, logger, phase, clientName } = options;
-  const meta = clientName !== undefined ? { clientName } : undefined;
-  const msgs =
-    phase === 'discovery'
-      ? {
-          streamableOk: 'Discovery: connected via Streamable HTTP',
-          noSse: 'Streamable HTTP connection failed, not trying SSE fallback',
-          trySse: 'Streamable HTTP connection failed, trying SSE fallback',
-          sseOk: 'Discovery: connected to remote MCP server via SSE',
-        }
-      : {
-          streamableOk: 'Connected to remote MCP server via Streamable HTTP',
-          noSse: 'Streamable HTTP failed, not trying SSE fallback',
-          trySse: 'Streamable HTTP failed, trying SSE fallback',
-          sseOk: 'Connected to remote MCP server via SSE',
-        };
-
-  try {
-    const httpTransport = new StreamableHTTPClientTransport(remoteUrl, {
-      authProvider,
-      ...(options.fetch ? { fetch: options.fetch } : {}),
-    });
-    await client.connect(httpTransport);
-    logger.info(msgs.streamableOk, meta);
-  } catch (httpErr) {
-    const detail = errorDetail(httpErr);
-    const category = classifyError(httpErr);
-    if (!shouldFallbackToSse(httpErr)) {
-      logger.warn(msgs.noSse, { category, error: detail });
-      throw httpErr;
-    }
-    logger.warn(msgs.trySse, { category, error: detail });
-    const sseTransport = new SSEClientTransport(remoteUrl, { authProvider });
-    await client.connect(sseTransport);
-    logger.info(msgs.sseOk, meta);
-  }
-}
-
-export interface ProxyHandle {
+export interface ProxySession {
+  localServer: Server;
   close(): Promise<void>;
 }
 
-export async function createProxy(
+export interface CreateProxySessionOptions {
+  discoveredCapabilities: ServerCapabilities;
+  remoteServerInfo: Implementation | undefined;
+  /**
+   * `exit` — stdin/local close shuts down the process (stdio mode).
+   * `close` — tear down this session only; keep the process up (HTTP mode).
+   */
+  onLocalDisconnect: 'exit' | 'close';
+}
+
+export function createProxySession(
   config: Config,
   tokenManager: TokenManager,
   logger: Logger,
-  /** Absolute deadline (Date.now()-based) for Phase 1 remote readiness; defaults to now + startupTimeoutMs. */
-  startupDeadlineMs: number = Date.now() + config.startupTimeoutMs,
-): Promise<ProxyHandle> {
+  options: CreateProxySessionOptions,
+): ProxySession {
   const remoteUrl = new URL(config.remoteMcpUrl);
+  const discoveredCapabilities = options.discoveredCapabilities;
 
-  // --- Phase 1: Required discovery connection (retry until shared startup deadline) ---
-  let discoveredCapabilities: ServerCapabilities = {};
-  let remoteServerInfo: Implementation | undefined;
-
-  const PHASE1_RETRY_BASE_MS = 1000;
-  const PHASE1_RETRY_MAX_MS = 60000;
-
-  async function connectDiscoveryClient(): Promise<{
-    capabilities: ServerCapabilities;
-    serverInfo: Implementation | undefined;
-  }> {
-    const discoveryClient = new Client(
-      { name: PROXY_NAME, version: PKG_VERSION },
-      { capabilities: withClientCredentialsExtension({}) },
-    );
-
-    await connectWithTransportFallback(discoveryClient, remoteUrl, {
-      authProvider: tokenManager.getAuthProvider(),
-      fetch: tokenManager.getScopeStepUpFetch(),
-      logger,
-      phase: 'discovery',
-    });
-
-    const capabilities = discoveryClient.getServerCapabilities() ?? {};
-    const serverInfo = discoveryClient.getServerVersion();
-    await discoveryClient.close();
-    logger.debug('Discovery connection closed');
-    return { capabilities, serverInfo };
-  }
-
-  let phase1Attempt = 0;
-  while (true) {
-    logger.info('Connecting to remote MCP server for discovery', {
-      url: config.remoteMcpUrl,
-      attempt: phase1Attempt + 1,
-    });
-    try {
-      const result = await connectDiscoveryClient();
-      discoveredCapabilities = result.capabilities;
-      remoteServerInfo = result.serverInfo;
-      break;
-    } catch (err) {
-      const detail = errorDetail(err);
-      const category = classifyError(err);
-      const authFailureSource = resolveUnrecoverableStartupAuthSource(err);
-      if (authFailureSource) {
-        const message = formatUnrecoverableOAuthMisconfig(detail, authFailureSource);
-        logger.error(message, {
-          category: 'authentication',
-          unrecoverable: true,
-          failureSource: authFailureSource,
-          error: detail,
-        });
-        throw new Error(message, { cause: err });
-      }
-      const remaining = startupDeadlineMs - Date.now();
-      if (remaining <= 0) {
-        throw new Error(
-          `Remote MCP server unreachable within startup timeout: ${detail}`,
-          { cause: err },
-        );
-      }
-      const delayMs = Math.min(
-        getBackoffDelay(phase1Attempt, PHASE1_RETRY_BASE_MS, PHASE1_RETRY_MAX_MS),
-        remaining,
-      );
-      logger.warn('Remote MCP server unreachable during discovery, retrying', {
-        category,
-        error: detail,
-        attempt: phase1Attempt + 1,
-        delayMs,
-        remainingMs: remaining,
-      });
-      await sleep(delayMs);
-      phase1Attempt++;
-    }
-  }
-
-  // --- Phase 2: Create local server with discovered info ---
   const localServer = new Server(
-    remoteServerInfo ?? { name: PROXY_NAME, version: PKG_VERSION },
+    options.remoteServerInfo ?? { name: PROXY_NAME, version: PKG_VERSION },
     { capabilities: { ...discoveredCapabilities } },
   );
 
-  // --- Phase 3: Reconnect with real client identity after local handshake ---
   let remoteClient: Client | undefined;
   let readyResolve: () => void;
   const readyPromise = new Promise<void>((resolve) => { readyResolve = resolve; });
@@ -408,6 +228,7 @@ export async function createProxy(
         logger.info('Reconnection successful');
       }
       reconnectAttempt = 0;
+      void tokenManager.rediscoverOAuthMetadata();
     } catch (err) {
       const detail = errorDetail(err);
       const category = classifyError(err);
@@ -578,26 +399,39 @@ export async function createProxy(
     });
   };
 
-  const stdioTransport = new StdioServerTransport();
-  await localServer.connect(stdioTransport);
-  logger.info('Local MCP server started on stdio');
-
   localServer.onclose = () => {
     if (closingIntentionally) return;
-    logger.info('Local client disconnected, shutting down');
+    if (options.onLocalDisconnect === 'exit') {
+      logger.info('Local client disconnected, shutting down');
+      closingIntentionally = true;
+      reconnecting = true;
+      stopPolling();
+      if (remoteClient) {
+        const client = remoteClient;
+        Promise.race([
+          client.close(),
+          new Promise((r) => setTimeout(r, 2000)),
+        ]).catch(() => {}).finally(() => {
+          process.exit(0);
+        });
+      } else {
+        process.exit(0);
+      }
+      return;
+    }
+
+    logger.info('Local MCP session closed');
     closingIntentionally = true;
     reconnecting = true;
     stopPolling();
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = undefined;
+    }
     if (remoteClient) {
       const client = remoteClient;
-      Promise.race([
-        client.close(),
-        new Promise((r) => setTimeout(r, 2000)),
-      ]).catch(() => {}).finally(() => {
-        process.exit(0);
-      });
-    } else {
-      process.exit(0);
+      remoteClient = undefined;
+      void client.close().catch(() => {});
     }
   };
 
@@ -681,8 +515,9 @@ export async function createProxy(
   }
 
   return {
+    localServer,
     async close() {
-      logger.info('Shutting down proxy');
+      logger.info('Shutting down proxy session');
       closingIntentionally = true;
       reconnecting = true;
       if (reconnectTimer) {

@@ -51,6 +51,11 @@ function createTestConfig(overrides?: Partial<Config>): Config {
     requestTimeoutMs: 30000,
     startupTimeoutMs: 60000,
     capabilitiesPollSeconds: 60,
+    transport: 'stdio',
+    listenHost: '127.0.0.1',
+    listenPort: 8080,
+    listenPath: '/mcp',
+    oauthRediscoverySeconds: 3600,
     debug: false,
     ...overrides,
   };
@@ -1121,6 +1126,233 @@ describe('TokenManager', () => {
       expect(tm.getCurrentScopes()).toBe('read write');
       expect(tm.getAccessToken()).toBe('good-token');
       expect(tm.hasUsableAccessToken()).toBe(true);
+    });
+  });
+
+  describe('rediscoverOAuthMetadata', () => {
+    it('keeps the current token when metadata is unchanged', async () => {
+      setupAuthenticatedDiscovery();
+      mockAuth.mockImplementation(async (provider) => {
+        await Promise.resolve(provider.saveTokens({
+          access_token: 'tok',
+          token_type: 'bearer',
+          expires_in: 3600,
+        }));
+        return 'AUTHORIZED';
+      });
+
+      const logger = createMockLogger();
+      const tm = createTokenManager(createTestConfig(), logger);
+      await tm.discover();
+      await tm.prefetch();
+      expect(tm.getAccessToken()).toBe('tok');
+
+      await tm.rediscoverOAuthMetadata();
+
+      expect(tm.getAccessToken()).toBe('tok');
+      expect(logger.info).toHaveBeenCalledWith('OAuth rediscovery unchanged');
+    });
+
+    it('clears and reacquires token on significant metadata change', async () => {
+      setupAuthenticatedDiscovery();
+      mockAuth.mockImplementation(async (provider) => {
+        await Promise.resolve(provider.saveTokens({
+          access_token: 'tok-old',
+          token_type: 'bearer',
+          expires_in: 3600,
+        }));
+        return 'AUTHORIZED';
+      });
+
+      const logger = createMockLogger();
+      const tm = createTokenManager(createTestConfig(), logger);
+      await tm.discover();
+      await tm.prefetch();
+
+      mockDiscoverAS.mockResolvedValue(
+        asMetadata({
+          issuer: 'https://auth.example.com',
+          token_endpoint: 'https://auth.example.com/token-v2',
+          grant_types_supported: ['client_credentials', 'authorization_code'],
+          token_endpoint_auth_methods_supported: ['client_secret_basic'],
+        }),
+      );
+      mockAuth.mockImplementation(async (provider) => {
+        await Promise.resolve(provider.saveTokens({
+          access_token: 'tok-new',
+          token_type: 'bearer',
+          expires_in: 3600,
+        }));
+        return 'AUTHORIZED';
+      });
+
+      await tm.rediscoverOAuthMetadata();
+
+      expect(logger.info).toHaveBeenCalledWith(
+        'OAuth rediscovery detected significant change; reacquiring token',
+        expect.objectContaining({ changes: expect.arrayContaining(['tokenEndpoint']) }),
+      );
+      expect(tm.getAccessToken()).toBe('tok-new');
+    });
+
+    it('skips rediscovery when manual token endpoint is configured', async () => {
+      const logger = createMockLogger();
+      const tm = createTokenManager(
+        createTestConfig({ tokenEndpoint: 'https://auth.example.com/oauth/token' }),
+        logger,
+      );
+      await tm.discover();
+
+      mockDiscoverResource.mockClear();
+      mockDiscoverAS.mockClear();
+      await tm.rediscoverOAuthMetadata();
+
+      expect(mockDiscoverResource).not.toHaveBeenCalled();
+      expect(mockDiscoverAS).not.toHaveBeenCalled();
+      expect(logger.debug).toHaveBeenCalledWith(
+        'Skipping OAuth rediscovery (manual token endpoint configured)',
+      );
+    });
+
+    it('coalesces concurrent rediscovery calls', async () => {
+      setupAuthenticatedDiscovery();
+      mockAuth.mockImplementation(async (provider) => {
+        await Promise.resolve(provider.saveTokens({
+          access_token: 'tok',
+          token_type: 'bearer',
+          expires_in: 3600,
+        }));
+        return 'AUTHORIZED';
+      });
+
+      const tm = createTokenManager(createTestConfig(), createMockLogger());
+      await tm.discover();
+
+      let discoverCalls = 0;
+      mockDiscoverResource.mockImplementation(async () => {
+        discoverCalls++;
+        await Promise.resolve();
+        return {
+          resource: 'https://mcp.example.com/mcp',
+          authorization_servers: ['https://auth.example.com'],
+          scopes_supported: ['read', 'write'],
+        };
+      });
+
+      await Promise.all([tm.rediscoverOAuthMetadata(), tm.rediscoverOAuthMetadata()]);
+      expect(discoverCalls).toBe(1);
+    });
+
+    it('preserves prior token when rediscovery transport fails', async () => {
+      setupAuthenticatedDiscovery();
+      mockAuth.mockImplementation(async (provider) => {
+        await Promise.resolve(provider.saveTokens({
+          access_token: 'tok',
+          token_type: 'bearer',
+          expires_in: 3600,
+        }));
+        return 'AUTHORIZED';
+      });
+
+      const logger = createMockLogger();
+      const tm = createTokenManager(createTestConfig(), logger);
+      await tm.discover();
+      await tm.prefetch();
+
+      mockDiscoverResource.mockRejectedValue(new Error('PRM down'));
+      mockDiscoverAS.mockRejectedValue(new Error('AS down'));
+
+      await tm.rediscoverOAuthMetadata();
+
+      expect(tm.getAccessToken()).toBe('tok');
+      expect(tm.getAuthMode().type).toBe('authenticated');
+      expect(logger.warn).toHaveBeenCalledWith(
+        'OAuth rediscovery failed; keeping previous discovery and token',
+        expect.objectContaining({ category: 'authentication' }),
+      );
+    });
+
+    it('does not downgrade authenticated to no-auth on partial AS discovery failure', async () => {
+      setupAuthenticatedDiscovery();
+      mockAuth.mockImplementation(async (provider) => {
+        await Promise.resolve(provider.saveTokens({
+          access_token: 'tok',
+          token_type: 'bearer',
+          expires_in: 3600,
+        }));
+        return 'AUTHORIZED';
+      });
+
+      const logger = createMockLogger();
+      const tm = createTokenManager(createTestConfig(), logger);
+      await tm.discover();
+      await tm.prefetch();
+
+      // PRM still succeeds; AS discovery fails → discoverOAuthForRemote returns no-auth.
+      mockDiscoverAS.mockRejectedValue(new Error('AS down'));
+
+      await tm.rediscoverOAuthMetadata();
+
+      expect(tm.getAccessToken()).toBe('tok');
+      expect(tm.getAuthMode().type).toBe('authenticated');
+      expect(logger.warn).toHaveBeenCalledWith(
+        'OAuth rediscovery reported no-auth while previously authenticated; keeping previous discovery and token',
+        expect.objectContaining({ category: 'authentication' }),
+      );
+    });
+
+    it('does not start rediscovery timer when oauthRediscoverySeconds is 0', async () => {
+      setupAuthenticatedDiscovery();
+      mockAuth.mockImplementation(async (provider) => {
+        await Promise.resolve(provider.saveTokens({
+          access_token: 'tok',
+          token_type: 'bearer',
+          expires_in: 3600,
+        }));
+        return 'AUTHORIZED';
+      });
+
+      const logger = createMockLogger();
+      const tm = createTokenManager(
+        createTestConfig({ oauthRediscoverySeconds: 0 }),
+        logger,
+      );
+      await tm.waitUntilAuthReady(Date.now() + 5000);
+
+      expect(logger.info).not.toHaveBeenCalledWith(
+        'OAuth rediscovery schedule started',
+        expect.anything(),
+      );
+      tm.stop();
+    });
+
+    it('invokes scheduled rediscovery on the configured interval', async () => {
+      setupAuthenticatedDiscovery();
+      mockAuth.mockImplementation(async (provider) => {
+        await Promise.resolve(provider.saveTokens({
+          access_token: 'tok',
+          token_type: 'bearer',
+          expires_in: 3600,
+        }));
+        return 'AUTHORIZED';
+      });
+
+      const logger = createMockLogger();
+      const tm = createTokenManager(
+        createTestConfig({ oauthRediscoverySeconds: 10 }),
+        logger,
+      );
+      await tm.waitUntilAuthReady(Date.now() + 5000);
+
+      expect(logger.info).toHaveBeenCalledWith(
+        'OAuth rediscovery schedule started',
+        { intervalSeconds: 10 },
+      );
+
+      mockDiscoverResource.mockClear();
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(mockDiscoverResource).toHaveBeenCalled();
+      tm.stop();
     });
   });
 });

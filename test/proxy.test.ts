@@ -100,6 +100,11 @@ function createMockConfig(overrides?: Partial<Config>): Config {
     requestTimeoutMs: 30000,
     startupTimeoutMs: 60000,
     capabilitiesPollSeconds: 0,
+    transport: 'stdio',
+    listenHost: '127.0.0.1',
+    listenPort: 8080,
+    listenPath: '/mcp',
+    oauthRediscoverySeconds: 3600,
     debug: false,
     ...overrides,
   };
@@ -127,12 +132,13 @@ function createMockTokenManager(mode: AuthMode = { type: 'authenticated', provid
     getCurrentScopes: vi.fn().mockReturnValue(undefined),
     stepUpScopes: vi.fn().mockResolvedValue(undefined),
     getScopeStepUpFetch: vi.fn().mockReturnValue(fetch),
+    rediscoverOAuthMetadata: vi.fn().mockResolvedValue(undefined),
     invalidate: vi.fn(),
     stop: vi.fn(),
   };
 }
 
-describe('Proxy (createProxy integration)', () => {
+describe('Proxy (createStdioProxy integration)', () => {
   let endClient: Client;
   let proxyHandle: { close(): Promise<void> };
   let logger: Logger;
@@ -146,8 +152,8 @@ describe('Proxy (createProxy integration)', () => {
     logger = createMockLogger();
     const tokenManager = createMockTokenManager();
 
-    const { createProxy } = await import('../src/proxy.js');
-    proxyHandle = await createProxy(config, tokenManager, logger);
+    const { createStdioProxy } = await import('../src/proxy-stdio.js');
+    proxyHandle = await createStdioProxy(config, tokenManager, logger);
 
     endClient = new Client(
       { name: 'test-client', version: '2.5.0' },

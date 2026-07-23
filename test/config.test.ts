@@ -160,4 +160,46 @@ describe('Config', () => {
     expect(() => loadConfig()).toThrow('Invalid configuration');
   });
 
+  it('defaults transport to stdio and listen settings', () => {
+    setRequiredEnv();
+    const config = loadConfig();
+    expect(config.transport).toBe('stdio');
+    expect(config.listenHost).toBe('127.0.0.1');
+    expect(config.listenPort).toBe(8080);
+    expect(config.listenPath).toBe('/mcp');
+    expect(config.oauthRediscoverySeconds).toBe(3600);
+  });
+
+  it('parses MCP_CC_PROXY_TRANSPORT=http and listen settings', () => {
+    setRequiredEnv();
+    process.env.MCP_CC_PROXY_TRANSPORT = 'http';
+    process.env.MCP_CC_PROXY_LISTEN_HOST = '0.0.0.0';
+    process.env.MCP_CC_PROXY_LISTEN_PORT = '9090';
+    process.env.MCP_CC_PROXY_LISTEN_PATH = 'mcp-proxy';
+    const config = loadConfig();
+    expect(config.transport).toBe('http');
+    expect(config.listenHost).toBe('0.0.0.0');
+    expect(config.listenPort).toBe(9090);
+    expect(config.listenPath).toBe('/mcp-proxy');
+  });
+
+  it('rejects invalid transport', () => {
+    setRequiredEnv();
+    process.env.MCP_CC_PROXY_TRANSPORT = 'websocket';
+    expect(() => loadConfig()).toThrow('Invalid configuration');
+  });
+
+  it('allows oauthRediscoverySeconds of 0', () => {
+    setRequiredEnv();
+    process.env.MCP_CC_PROXY_OAUTH_REDISCOVERY_SECONDS = '0';
+    const config = loadConfig();
+    expect(config.oauthRediscoverySeconds).toBe(0);
+  });
+
+  it('rejects negative oauthRediscoverySeconds', () => {
+    setRequiredEnv();
+    process.env.MCP_CC_PROXY_OAUTH_REDISCOVERY_SECONDS = '-1';
+    expect(() => loadConfig()).toThrow('Invalid configuration');
+  });
+
 });

@@ -72,6 +72,11 @@ function createMockConfig(overrides?: Partial<Config>): Config {
     requestTimeoutMs: 30000,
     startupTimeoutMs: 60000,
     capabilitiesPollSeconds: 0,
+    transport: 'stdio',
+    listenHost: '127.0.0.1',
+    listenPort: 8080,
+    listenPath: '/mcp',
+    oauthRediscoverySeconds: 3600,
     debug: false,
     ...overrides,
   };
@@ -103,6 +108,7 @@ function createMockTokenManager(
     getCurrentScopes: vi.fn().mockReturnValue(undefined),
     stepUpScopes: vi.fn().mockResolvedValue(undefined),
     getScopeStepUpFetch: vi.fn().mockReturnValue(fetch),
+    rediscoverOAuthMetadata: vi.fn().mockResolvedValue(undefined),
     invalidate: vi.fn(),
     stop: vi.fn(),
   };
@@ -122,8 +128,8 @@ async function setupProxy(opts?: {
     hasUsableAccessToken: opts?.hasUsableAccessToken,
   });
 
-  const { createProxy } = await import('../src/proxy.js');
-  const proxyHandle = await createProxy(config, tokenManager, logger);
+  const { createStdioProxy } = await import('../src/proxy-stdio.js');
+  const proxyHandle = await createStdioProxy(config, tokenManager, logger);
 
   const endClient = new Client(
     { name: 'test-client', version: '2.5.0' },
@@ -208,8 +214,8 @@ describe('Proxy capabilities polling', () => {
       { name: 'tool-a', description: 'A', inputSchema: { type: 'object' as const } },
     ];
 
-    const { createProxy } = await import('../src/proxy.js');
-    proxyHandle = await createProxy(config, tokenManager, logger);
+    const { createStdioProxy } = await import('../src/proxy-stdio.js');
+    proxyHandle = await createStdioProxy(config, tokenManager, logger);
 
     // Set up request handler on all upstream servers
     for (const s of upstreamServers) {
@@ -296,8 +302,8 @@ describe('Proxy resources and prompts polling', () => {
 
     const resourceList = [{ uri: 'file:///a', name: 'A' }];
 
-    const { createProxy } = await import('../src/proxy.js');
-    proxyHandle = await createProxy(config, tokenManager, logger);
+    const { createStdioProxy } = await import('../src/proxy-stdio.js');
+    proxyHandle = await createStdioProxy(config, tokenManager, logger);
 
     for (const s of upstreamServers) {
       s.fallbackRequestHandler = async (request) => {
@@ -341,8 +347,8 @@ describe('Proxy resources and prompts polling', () => {
     const logger = createMockLogger();
     const tokenManager = createMockTokenManager();
 
-    const { createProxy } = await import('../src/proxy.js');
-    proxyHandle = await createProxy(config, tokenManager, logger);
+    const { createStdioProxy } = await import('../src/proxy-stdio.js');
+    proxyHandle = await createStdioProxy(config, tokenManager, logger);
 
     for (const s of upstreamServers) {
       s.fallbackRequestHandler = async (request) => {
@@ -397,8 +403,8 @@ describe('Proxy buildClientIdentity fallback', () => {
     const logger = createMockLogger();
     const tokenManager = createMockTokenManager();
 
-    const { createProxy } = await import('../src/proxy.js');
-    proxyHandle = await createProxy(config, tokenManager, logger);
+    const { createStdioProxy } = await import('../src/proxy-stdio.js');
+    proxyHandle = await createStdioProxy(config, tokenManager, logger);
 
     // Connect a client without a name
     endClient = new Client(

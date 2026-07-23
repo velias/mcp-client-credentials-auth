@@ -3,7 +3,10 @@
 import { loadConfig } from './config.js';
 import { createLogger } from './logger.js';
 import { createTokenManager } from './token-manager.js';
-import { createProxy, PKG_VERSION, type ProxyHandle } from './proxy.js';
+import { createHttpProxy } from './proxy-http.js';
+import { createStdioProxy } from './proxy-stdio.js';
+import { PKG_VERSION } from './proxy-utils.js';
+import type { ProxyHandle } from './proxy-handle.js';
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -40,6 +43,15 @@ async function main(): Promise<void> {
   logger.info(`Starting mcp-client-credentials-auth proxy v${PKG_VERSION}`, {
     remote: config.remoteMcpUrl,
     clientId: config.clientId,
+    transport: config.transport,
+    ...(config.transport === 'http'
+      ? {
+          listenHost: config.listenHost,
+          listenPort: config.listenPort,
+          listenPath: config.listenPath,
+        }
+      : {}),
+    oauthRediscoverySeconds: config.oauthRediscoverySeconds,
     refreshSkewSeconds: config.refreshSkewSeconds,
     requestTimeoutMs: config.requestTimeoutMs,
     startupTimeoutMs: config.startupTimeoutMs,
@@ -61,7 +73,10 @@ async function main(): Promise<void> {
 
   let proxy: ProxyHandle;
   try {
-    proxy = await createProxy(config, tokenManager, logger, startupDeadlineMs);
+    proxy =
+      config.transport === 'http'
+        ? await createHttpProxy(config, tokenManager, logger, startupDeadlineMs)
+        : await createStdioProxy(config, tokenManager, logger, startupDeadlineMs);
   } catch (err) {
     logger.error('Failed to start proxy', {
       category: 'connection',

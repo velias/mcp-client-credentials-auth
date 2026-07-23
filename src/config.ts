@@ -11,6 +11,13 @@ const httpOrHttpsUrl = z.url().check(
   }, 'URL scheme must be http or https'),
 );
 
+function normalizeListenPath(path: string): string {
+  if (!path.startsWith('/')) {
+    return `/${path}`;
+  }
+  return path;
+}
+
 export const ConfigSchema = z.object({
   remoteMcpUrl: httpOrHttpsUrl,
   clientId: z.string().min(1),
@@ -22,6 +29,11 @@ export const ConfigSchema = z.object({
   scopes: z.string().optional(),
   tokenEndpoint: httpOrHttpsUrl.optional(),
   debug: z.boolean().default(false),
+  transport: z.enum(['stdio', 'http']).default('stdio'),
+  listenHost: z.string().min(1).default('127.0.0.1'),
+  listenPort: z.number().int().min(1).max(65535).default(8080),
+  listenPath: z.string().min(1).default('/mcp').transform(normalizeListenPath),
+  oauthRediscoverySeconds: z.number().int().min(0).default(3600),
 });
 
 export type Config = z.infer<typeof ConfigSchema>;
@@ -53,6 +65,13 @@ export function loadConfig(): Config {
     scopes: process.env.MCP_CC_PROXY_SCOPES || undefined,
     tokenEndpoint: process.env.MCP_CC_PROXY_TOKEN_ENDPOINT || undefined,
     debug: parseBool(process.env.MCP_CC_PROXY_DEBUG),
+    transport: process.env.MCP_CC_PROXY_TRANSPORT || undefined,
+    listenHost: process.env.MCP_CC_PROXY_LISTEN_HOST || undefined,
+    listenPort: parseNumber(process.env.MCP_CC_PROXY_LISTEN_PORT),
+    listenPath: process.env.MCP_CC_PROXY_LISTEN_PATH || undefined,
+    oauthRediscoverySeconds: parseNumber(
+      process.env.MCP_CC_PROXY_OAUTH_REDISCOVERY_SECONDS,
+    ),
   };
 
   const result = ConfigSchema.safeParse(raw);

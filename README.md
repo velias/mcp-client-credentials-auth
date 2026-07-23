@@ -4,9 +4,9 @@
 [![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/velias/f550f0ffe68a574a690032088359fef3/raw/mcp-client-credentials-auth-coverage.json)](https://github.com/velias/mcp-client-credentials-auth/actions/workflows/ci.yml)
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/velias/mcp-client-credentials-auth/badge)](https://securityscorecards.dev/viewer/?uri=github.com/velias/mcp-client-credentials-auth)
 
-A local stdio MCP server that authenticates to remote OAuth-protected MCP servers using the **client_credentials** grant ([MCP OAuth Client Credentials extension](https://modelcontextprotocol.io/extensions/auth/oauth-client-credentials), [client secrets](https://modelcontextprotocol.io/extensions/auth/oauth-client-credentials#client-secrets) variant). Throughout this document, we refer to it as **the auth proxy**.
+This app acts as an MCP server that authenticates to remote OAuth-protected MCP servers using the **client_credentials** grant ([MCP OAuth Client Credentials extension](https://modelcontextprotocol.io/extensions/auth/oauth-client-credentials), [client secrets](https://modelcontextprotocol.io/extensions/auth/oauth-client-credentials#client-secrets) variant). Throughout this document, we refer to it as **the auth proxy**.
 
-Drop it into any MCP client configuration for autonomous agents, background services, CI/CD, and other machine-to-machine use (no user in the loop). It acquires access tokens and forwards MCP traffic transparently. By default the token endpoint and scopes are auto-discovered via [MCP Authorization](https://modelcontextprotocol.io/specification/2025-11-05/basic/authorization) and RFC 9728 / RFC 8414. When discovery is unavailable, set a manual token endpoint; see [Servers without OAuth discovery](#servers-without-oauth-discovery).
+Drop it into any MCP client configuration for autonomous agents, background services, CI/CD, and other machine-to-machine use (no user in the loop). It acquires access tokens and forwards MCP traffic transparently. By default the token endpoint and scopes are auto-discovered via [MCP Authorization](https://modelcontextprotocol.io/specification/2025-11-05/basic/authorization) and RFC 9728 / RFC 8414. When discovery is unavailable, set a manual token endpoint; see [Servers without OAuth discovery](#servers-without-oauth-discovery). For a shared on-premises deployment instead of local stdio, see [On-premises HTTP deployment](#on-premises-http-deployment-alternative).
 
 To obtain `client_id` and `client_secret`, look for a "Service Account", "API Key", or "Machine-to-Machine Application" option in the remote MCP service's account or developer settings. Naming varies by provider. Well-behaved services issue credentials that already work with their MCP Server published discovery metadata (or provide instructions how to self-grant them), so you normally need only the remote URL plus those two values (see [Notes for MCP Server Developers](#notes-for-mcp-server-developers)).
 
@@ -25,9 +25,7 @@ MCP Client ←→ [stdio] ←→ mcp-client-credentials-auth ←→ [HTTP/SSE + 
 4. Refreshes tokens proactively and retries on 401
 5. On Streamable HTTP, if the remote returns `403` with `insufficient_scope`, can expand scopes, get a new token, and retry once (see [Known Issues](#scope-step-up-and-the-mcp-typescript-sdk))
 
-Designed for minimal end-user config: with MCP Authorization discovery, URL + `client_id` + `client_secret` is enough when the MCP service's discovery and issued credentials line up. Manual `MCP_CC_PROXY_TOKEN_ENDPOINT` / `MCP_CC_PROXY_SCOPES` are escape hatches (no discovery, Entra `.default`, or provider-documented overrides), not the default path.
-
-Other features: Streamable HTTP with SSE fallback for transport failures only; fail-closed startup (stdio binds only after a usable token when auth is required and the remote is reachable); automatic reconnection and stale Streamable HTTP session recovery; capability polling; identity/capability forwarding; timeouts on all outgoing calls; generic pass-through (no hardcoded method tables).
+Also: Streamable HTTP with SSE fallback for transport failures only; fail-closed startup (local transport binds only after a usable token when auth is required and the remote is reachable); automatic reconnection and stale Streamable HTTP session recovery; capability polling; identity/capability forwarding; timeouts on all outgoing calls; generic pass-through (no hardcoded method tables). See [When the proxy starts or stays up](#when-the-proxy-starts-or-stays-up).
 
 ## Quick Start
 
@@ -47,9 +45,7 @@ Other features: Streamable HTTP with SSE fallback for transport failures only; f
 }
 ```
 
-Token endpoint and scopes are auto-discovered. If discovery is unavailable, set `MCP_CC_PROXY_TOKEN_ENDPOINT` (and usually `MCP_CC_PROXY_SCOPES`); see [Servers without OAuth discovery](#servers-without-oauth-discovery).
-
-**Security note:** `npx` downloads and runs the package on your machine. Use trusted packages only.
+**Security note:** `npx` downloads and runs the published [`mcp-client-credentials-auth`](https://www.npmjs.com/package/mcp-client-credentials-auth) package on your machine. Use trusted packages only. If discovery is unavailable, see [Servers without OAuth discovery](#servers-without-oauth-discovery).
 
 ## Configuration
 
@@ -60,21 +56,26 @@ All configuration via `MCP_CC_PROXY_*` environment variables:
 | `MCP_CC_PROXY_REMOTE_MCP_URL` | Yes | — | Remote MCP server URL (`http://` or `https://`) |
 | `MCP_CC_PROXY_CLIENT_ID` | Yes | — | OAuth client_id |
 | `MCP_CC_PROXY_CLIENT_SECRET` | Yes | — | OAuth client_secret |
-| `MCP_CC_PROXY_TOKEN_ENDPOINT` | No | — | IdP token endpoint URL. When set, skips MCP Authorization discovery and posts tokens here. Prefer `https://`; cleartext HTTP to a non-loopback host logs a warning. See [Servers without OAuth discovery](#servers-without-oauth-discovery). |
-| `MCP_CC_PROXY_SCOPES` | No | auto-discovered | Space-separated scopes for the token request. Overrides discovered `scopes_supported`. Needed mainly with a manual token endpoint, Entra `.default`, or when the MCP server provider documents an override; prefer discovery + provider-issued credentials that already match. See [Notes for MCP Server Developers](#notes-for-mcp-server-developers). |
+| `MCP_CC_PROXY_TOKEN_ENDPOINT` | No | — | IdP token endpoint URL. When set, skips MCP Authorization discovery (PRM/AS) and posts tokens here. See [Servers without OAuth discovery](#servers-without-oauth-discovery). |
+| `MCP_CC_PROXY_SCOPES` | No | auto-discovered | Space-separated scopes for the token request. Overrides discovered `scopes_supported`. Required in practice with a manual token endpoint. |
 | `MCP_CC_PROXY_DEBUG` | No | `false` | Enable debug logging to stderr |
 | `MCP_CC_PROXY_REFRESH_SKEW_SECONDS` | No | `30` | Proactive token refresh window (seconds before expiry) |
 | `MCP_CC_PROXY_REQUEST_TIMEOUT_MS` | No | `30000` | Timeout for MCP requests, OAuth discovery, and token acquisition (ms) |
 | `MCP_CC_PROXY_STARTUP_TIMEOUT_MS` | No | `60000` | Shared wall-clock budget for a usable access token (when auth is required) and a reachable remote MCP before exit |
 | `MCP_CC_PROXY_CAPABILITIES_POLL_SECONDS` | No | `60` | Interval to poll remote capability changes (0 = disabled) |
+| `MCP_CC_PROXY_TRANSPORT` | No | `stdio` | Local transport: `stdio` (default) or `http` (on-premises Streamable HTTP). See [On-premises HTTP deployment](#on-premises-http-deployment-alternative). |
+| `MCP_CC_PROXY_LISTEN_HOST` | No | `127.0.0.1` | HTTP bind host (HTTP mode only; container image defaults to `0.0.0.0`) |
+| `MCP_CC_PROXY_LISTEN_PORT` | No | `8080` | HTTP bind port (HTTP mode only) |
+| `MCP_CC_PROXY_LISTEN_PATH` | No | `/mcp` | MCP Streamable HTTP mount path (HTTP mode only) |
+| `MCP_CC_PROXY_OAUTH_REDISCOVERY_SECONDS` | No | `3600` | Interval to re-fetch OAuth PRM/AS metadata (both transports). `0` disables the timer only. See [OAuth discovery and scopes at runtime](#oauth-discovery-and-scopes-at-runtime). |
 
 ### Servers without OAuth discovery
 
-Use when the remote MCP server accepts `Bearer` tokens but MCP Authorization discovery (RFC 9728 / RFC 8414) is not available. The proxy still uses `client_credentials`; configure the token endpoint and scopes from values provided by the MCP server provider (do not invent them). Prefer auto-discovery when available. If `MCP_CC_PROXY_TOKEN_ENDPOINT` is set, the manual path is used even when discovery would have worked.
+Use when the remote MCP server accepts `Bearer` tokens but MCP Authorization discovery (RFC 9728 / RFC 8414) is not available. The proxy still uses `client_credentials`; take the token endpoint and scopes from the MCP server provider (do not invent them). Prefer auto-discovery when available. If `MCP_CC_PROXY_TOKEN_ENDPOINT` is set, the manual path is used even when discovery would have worked (no PRM/AS fetch at startup or at runtime).
 
 **Required:** `MCP_CC_PROXY_REMOTE_MCP_URL`, `MCP_CC_PROXY_CLIENT_ID`, `MCP_CC_PROXY_CLIENT_SECRET`, `MCP_CC_PROXY_TOKEN_ENDPOINT`.
 
-**Usually also:** `MCP_CC_PROXY_SCOPES` (no discovered `scopes_supported` in this mode).
+**Usually also:** `MCP_CC_PROXY_SCOPES` (there is no discovered `scopes_supported` in this mode).
 
 Prefer `https://` for the token endpoint; cleartext HTTP to a non-loopback host logs a warning (client secret would travel unencrypted). Startup still requires a usable token and a reachable remote within `MCP_CC_PROXY_STARTUP_TIMEOUT_MS`.
 
@@ -96,7 +97,104 @@ Prefer `https://` for the token endpoint; cleartext HTTP to a non-loopback host 
 }
 ```
 
+## On-premises HTTP deployment (alternative)
+
+Use this when several MCP clients on a private network should share one outbound `client_credentials` identity, and you do not want to deploy this proxy on every client machine. Prefer local **stdio** (Quick Start) whenever a single client can spawn the proxy; HTTP adds a shared network attack surface.
+
+Set `MCP_CC_PROXY_TRANSPORT=http`. The process listens for cleartext Streamable HTTP on `MCP_CC_PROXY_LISTEN_HOST` / `PORT` / `PATH` (defaults: `127.0.0.1:8080/mcp`). There is **no inbound authentication** on the proxy: anyone who can open an MCP session gets the full remote service-account privilege.
+
+### Recommended HTTPS deployment
+
+Terminate TLS and client authentication at a reverse proxy or ingress (nginx, Envoy, OpenShift Route, etc.). Clients use `https://mcp-proxy.example.com/mcp`; the reverse proxy forwards to `http://127.0.0.1:8080/mcp` or the container service on a private network. This process does not terminate TLS. Do not publish `:8080` to untrusted networks; plain `http://` to a non-loopback host is not a production layout. HTTPS alone is not who-may-call; use mTLS, OAuth at ingress, or IP allowlists in practice. An [MCP gateway](#using-an-mcp-gateway-optional-hardening) can fill this same edge role (TLS + inbound auth) instead of a generic reverse proxy.
+
+```
+MCP Client ←→ [HTTPS + edge auth] ←→ Reverse proxy ←→ [HTTP private] ←→ mcp-client-credentials-auth ←→ [HTTPS + Bearer] ←→ Remote MCP Server
+                                                                                          ↓
+                                                                                    IdP Token Endpoint
+                                                                                (client_credentials grant)
+```
+
+### How to run
+
+Both options need the same OAuth env vars (`MCP_CC_PROXY_REMOTE_MCP_URL`, `MCP_CC_PROXY_CLIENT_ID`, `MCP_CC_PROXY_CLIENT_SECRET`, plus optional discovery overrides).
+
+#### A. Node / npm (no image)
+
+**From source** (clone this repo, then build and run locally):
+
+```bash
+git clone https://github.com/velias/mcp-client-credentials-auth.git
+cd mcp-client-credentials-auth
+npm ci && npm run build
+export MCP_CC_PROXY_REMOTE_MCP_URL=https://mcp.example.com/mcp
+export MCP_CC_PROXY_CLIENT_ID=my-service
+export MCP_CC_PROXY_CLIENT_SECRET=s3cr3t
+# optional: MCP_CC_PROXY_LISTEN_HOST / PORT / PATH (defaults: 127.0.0.1:8080/mcp)
+npm run start:http
+```
+
+**From the npm registry** (no clone; runs the published [`mcp-client-credentials-auth`](https://www.npmjs.com/package/mcp-client-credentials-auth) package):
+
+```bash
+export MCP_CC_PROXY_TRANSPORT=http
+export MCP_CC_PROXY_REMOTE_MCP_URL=https://mcp.example.com/mcp
+export MCP_CC_PROXY_CLIENT_ID=my-service
+export MCP_CC_PROXY_CLIENT_SECRET=s3cr3t
+npx -y mcp-client-credentials-auth
+```
+
+#### B. Container image (GHCR)
+
+Prerequisites: Docker or Podman. Podman is used in examples; you can use the `docker` command instead.
+
+Image: `ghcr.io/velias/mcp-client-credentials-auth` with tags `X.Y.Z`, `X.Y`, `X`, and `latest`. Defaults: `TRANSPORT=http`, `LISTEN_HOST=0.0.0.0`, port `8080`. 
+
+```bash
+podman run --name mcp-cc-proxy --rm \
+  -p 127.0.0.1:8080:8080 \
+  -e MCP_CC_PROXY_REMOTE_MCP_URL=https://mcp.example.com/mcp \
+  -e MCP_CC_PROXY_CLIENT_ID=my-service \
+  -e MCP_CC_PROXY_CLIENT_SECRET=s3cr3t \
+  ghcr.io/velias/mcp-client-credentials-auth:latest
+```
+
+Or pass `--env-file` for credentials.
+
+### Health probes
+
+HTTP mode exposes unauthenticated Kubernetes-style probes (process up only; they do not check the IdP, remote MCP, or token usability). Restrict at ingress if you do not want them reachable beyond the private network.
+
+| Path | Use | Response |
+|------|-----|----------|
+| `GET /health/live` | Liveness | `200` `{ "status": "ok" }` while the listener is up |
+| `GET /health/ready` | Readiness | `200` `{ "status": "ok" }` when accepting traffic; `503` `{ "status": "shutting_down" }` after shutdown starts |
+
+### Security considerations
+
+Beyond the HTTPS layout and [health probes](#health-probes) above:
+
+- **Reachability is authorization** — anyone who can open an MCP session (including via a mis-published `:8080` or the container's `0.0.0.0` bind) gets the full service-account privilege. Keep the listener on a private network only.
+- **One shared machine identity** — all sessions share the same Bearer token and scope set (including step-up). Session IDs are capability-like on the private hop. Not multi-tenant; use separate deployments per trust boundary.
+- **Credentials and logs** — env-held secrets are a shared blast radius; prefer vault/`--env-file` (see [Security](#security)) and rotate on compromise. Protect log sinks (URLs/client names; secrets are redacted). Keep images and the pinned base digest updated.
+
+### Using an MCP gateway (optional hardening)
+
+A generic **MCP gateway** can address several weak points above (inbound OAuth/OIDC, RBAC/tool ACL, rate limits, audit) and, when it terminates TLS for clients, can replace the separate reverse proxy in [Recommended HTTPS deployment](#recommended-https-deployment). It typically does **not** replace this proxy’s outbound `client_credentials` role.
+
+```
+MCP Client ←→ [user/agent identity] ←→ MCP gateway ←→ [trusted private MCP] ←→ mcp-client-credentials-auth ←→ [HTTPS + Bearer] ←→ Remote MCP Server
+                                                                                                    ↓
+                                                                                              IdP Token Endpoint
+                                                                                          (client_credentials grant)
+```
+
+- Gateway: inbound auth, who-may-call / tool policy, multi-tenant edge isolation, audit/rate limits, TLS for clients
+- This proxy: machine-token acquire/refresh on the private side
+- Keep proxy and secrets reachable only from the gateway (or an equivalent trusted path)
+
 ## Security
+
+Also see [On-premises HTTP deployment](#on-premises-http-deployment-alternative) when exposing the proxy over the network.
 
 ### Protecting Secrets with Vaults
 
@@ -205,7 +303,7 @@ Stderr lines also include `component=mcp-client-credentials-auth` so they remain
 
 ### When the proxy starts or stays up
 
-MCP clients typically treat a stdio server as healthy when the process is alive and `initialize` succeeds. They do not probe whether your IdP or remote MCP backend is working. This proxy **fail-closes at startup** and **self-heals at runtime**.
+For stdio, MCP clients typically treat the server as healthy when the process is alive and `initialize` succeeds; they do not probe whether your IdP or remote MCP backend is working. This proxy **fail-closes at startup** and **self-heals at runtime** (stdio and HTTP).
 
 **Startup (process exits; your MCP client should show the server in error):**
 
@@ -224,12 +322,11 @@ MCP clients typically treat a stdio server as healthy when the process is alive 
 |-----------|----------|
 | Remote MCP disconnects | Requests get `connection` errors (e.g. `temporarily unavailable (reconnecting)`). Indefinite background reconnect with backoff; resumes when the remote is back. |
 | Remote MCP restarted / Streamable HTTP session not found | Detects stale session (HTTP 404 or session-loss message), recreates the remote session, retries the request once; logs session lost and session reacquired on stderr. |
-| Remote MCP (or PRM) required scopes change while the proxy is running | Not detected automatically; refresh keeps prior scopes. Restart the proxy (and update `MCP_CC_PROXY_SCOPES` if used). |
-| Remote MCP Server or IdP discovery document changes while the proxy is running | Not detected automatically. Restart the proxy. |
+| Remote MCP / IdP OAuth metadata or discovered scopes change while running | Re-checked on successful remote reconnect and on the rediscovery interval. See [OAuth discovery and scopes at runtime](#oauth-discovery-and-scopes-at-runtime). |
 | IdP down but a cached access token is still valid | Keeps serving until the token is no longer usable. |
 | No usable access token and refresh/auth fails | Requests get a short `authentication` error (`no usable access token`). Indefinite background refresh/retry; resumes when a token is acquired again. |
 
-**Client reconnect:** for stdio MCP, "reconnect" means the client respawns this process and runs a new `initialize`. The MCP spec says clients SHOULD restart an unexpectedly exited server; in practice Cursor and many UIs often need a manual toggle or Reload Window after a red startup failure. Mid-session problems show up on tool/resource calls, not necessarily as a red server dot.
+**Client reconnect:** for stdio MCP, "reconnect" means the client respawns this process and runs a new `initialize`. The MCP spec says clients SHOULD restart an unexpectedly exited server; in practice Cursor and many MCP Clients often need a manual toggle or Reload Window after a red startup failure. Mid-session problems show up on tool/resource calls, not necessarily as a red server dot.
 
 ### Token acquired but remote server returns 403
 
@@ -246,11 +343,11 @@ Without `MCP_CC_PROXY_SCOPES`, the proxy requests the full discovered `scopes_su
 3. Compare with the scopes the remote MCP server requires for the failing operation.
 4. If scopes are missing, contact the MCP server operator (or follow their documented `MCP_CC_PROXY_SCOPES` / consent steps).
 
-### OAuth discovery and scopes are fixed at startup
+### OAuth discovery and scopes at runtime
 
-Protected resource metadata (RFC 9728), authorization server metadata (RFC 8414), and the scopes used for `client_credentials` are resolved once at startup (or taken from `MCP_CC_PROXY_SCOPES` / a manual token endpoint). Proactive refresh reuses the same scopes; it does not re-fetch those descriptors.
+Protected resource metadata (RFC 9728), authorization server metadata (RFC 8414), and scopes for `client_credentials` are resolved at startup (or taken from `MCP_CC_PROXY_SCOPES` / `MCP_CC_PROXY_TOKEN_ENDPOINT`). They are re-checked after a successful remote reconnect and on a schedule (`MCP_CC_PROXY_OAUTH_REDISCOVERY_SECONDS`, default 1 hour; `0` disables the timer only). Proactive token refresh does not re-fetch those descriptors.
 
-If required scopes or IdP/PRM metadata change, restart the proxy (and update `MCP_CC_PROXY_SCOPES` if used). Some servers return `401`/`invalid_token` for missing scopes instead of `403`/`insufficient_scope`, so this proxy cannot reliably step up scopes in that case; see [Known Issues](#known-issues).
+On a **significant** change (authorization server URL, token endpoint, issuer, discovered `scopes_supported` when `MCP_CC_PROXY_SCOPES` is unset, or auth mode flip), the proxy drops the cached access token and acquires a new one. Comparison uses PRM/AS discovery snapshots, not live step-up scope unions. Transient `.well-known` failures (including dual PRM/AS outage, or partial AS failure that would look like `no-auth`) keep the previous discovery and token when the process was already authenticated; rediscovery does not downgrade away from authenticated mode on those paths. With `MCP_CC_PROXY_TOKEN_ENDPOINT`, OAuth PRM/AS rediscovery is skipped entirely. `MCP_CC_PROXY_SCOPES` still wins over discovered scopes; if you rely on that override and scopes must change, update the env and restart.
 
 ## Notes for MCP Server Developers
 
@@ -310,7 +407,7 @@ During `initialize`, the auth proxy forwards identity and capabilities in both d
 2. **Local handshake** - present the remote server's identity to your MCP client
 3. **Reconnect** - reconnect to the remote with your client's real identity (plus a suffix) and capabilities
 
-Your MCP client sees the remote server's real name. The remote sees a name like `cursor-vscode via mcp-client-credentials-auth v0.1.0` with the client's version. Local capabilities (`sampling`, `roots`, `elicitation`, etc.) are forwarded so server-to-client features work through the proxy.
+Your MCP client sees the remote server's real name. The remote sees a name like `cursor-vscode via mcp-client-credentials-auth v0.2.0` with the client's version. Local capabilities (`sampling`, `roots`, `elicitation`, etc.) are forwarded so server-to-client features work through the proxy.
 
 The proxy also declares the [`io.modelcontextprotocol/oauth-client-credentials`](https://modelcontextprotocol.io/extensions/auth/oauth-client-credentials) extension on both connections so the remote can apply machine-to-machine policies.
 
@@ -327,7 +424,7 @@ The MCP TypeScript SDK has known bugs around scope step-up (403 `insufficient_sc
 
 Step-up is a runtime safety net when discovery (or a documented override) produced a valid starting token and the remote later challenges for more scopes the IdP will grant that client. For dual-flow servers, that means M2M step-up only works inside pre-granted service-account scopes; it is not a substitute for aligning `scopes_supported` with M2M credential issuance. A strict IdP rejecting the discovered set at startup is a server/provider configuration problem.
 
-**Not covered:** some servers (including some FastMCP paths) return `401` + `invalid_token` for missing scopes instead of `403` + `insufficient_scope`. That cannot be stepped up reliably; restart the proxy after required-scope policy changes. See [OAuth discovery and scopes are fixed at startup](#oauth-discovery-and-scopes-are-fixed-at-startup).
+**Not covered:** some servers (including some FastMCP paths) return `401` + `invalid_token` for missing scopes instead of `403` + `insufficient_scope`. That cannot be stepped up reliably; restart after required-scope policy changes, or rely on [OAuth rediscovery](#oauth-discovery-and-scopes-at-runtime) when discovered scopes change and `MCP_CC_PROXY_SCOPES` is unset.
 
 When both upstream issues are fixed in a released SDK, remove the workaround (see the MCP SDK upgrade checklist in [AGENTS.md](AGENTS.md)).
 

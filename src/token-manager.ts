@@ -1,19 +1,11 @@
 import {
-  ClientCredentialsProvider,
-} from '@modelcontextprotocol/sdk/client/auth-extensions.js';
-import {
-  auth,
-  discoverOAuthProtectedResourceMetadata,
-  discoverAuthorizationServerMetadata,
+  auth as sdkAuthFn,
   type OAuthClientProvider,
-  type OAuthDiscoveryState,
 } from '@modelcontextprotocol/sdk/client/auth.js';
-import type {
-  OAuthProtectedResourceMetadata,
-  OAuthTokens,
-  AuthorizationServerMetadata,
-} from '@modelcontextprotocol/sdk/shared/auth.js';
+import { ClientCredentialsProvider } from '@modelcontextprotocol/sdk/client/auth-extensions.js';
+import type { OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { FetchLike } from '@modelcontextprotocol/sdk/shared/transport.js';
+import * as sdkAuth from '@modelcontextprotocol/sdk/client/auth.js';
 import { getBackoffDelay, sleep } from './backoff.js';
 import type { Config } from './config.js';
 import {
@@ -23,13 +15,17 @@ import {
   isPermanentOAuthConfigError,
 } from './errors.js';
 import type { Logger } from './logger.js';
+import {
+  type AuthMode,
+  type OAuthDiscoverySnapshot,
+  describeSignificantOAuthChanges,
+  discoverOAuthForRemote,
+  isSignificantOAuthChange,
+} from './remote-oauth-discovery.js';
 import { createScopeStepUpFetch, mergeOAuthScopes } from './scope-step-up.js';
+import { createTokenRefreshController } from './token-refresh.js';
 
-export type AuthMode =
-  | { type: 'authenticated'; provider: ClientCredentialsProvider }
-  | { type: 'no-auth' }
-  | { type: 'unsupported-grant'; message: string }
-  | { type: 'discovery-failed'; message: string };
+export type { AuthMode } from './remote-oauth-discovery.js';
 
 export interface TokenManager {
   discover(): Promise<void>;
@@ -42,6 +38,7 @@ export interface TokenManager {
   getCurrentScopes(): string | undefined;
   stepUpScopes(challengeScopes: string): Promise<void>;
   getScopeStepUpFetch(): FetchLike;
+  rediscoverOAuthMetadata(): Promise<void>;
   invalidate(): void;
   stop(): void;
 }
@@ -49,34 +46,11 @@ export interface TokenManager {
 const AUTH_RETRY_BASE_MS = 5000;
 const AUTH_RETRY_MAX_MS = 60000;
 
-function seedManualDiscoveryState(
-  provider: ClientCredentialsProvider,
-  tokenEndpoint: string,
-  remoteMcpUrl: string,
-): void {
-  const issuer = new URL(tokenEndpoint).origin;
-  let discoveryState: OAuthDiscoveryState = {
-    authorizationServerUrl: issuer,
-    authorizationServerMetadata: {
-      issuer,
-      authorization_endpoint: tokenEndpoint,
-      token_endpoint: tokenEndpoint,
-      response_types_supported: [],
-      grant_types_supported: ['client_credentials'],
-      token_endpoint_auth_methods_supported: ['client_secret_basic'],
-    },
-    resourceMetadata: { resource: remoteMcpUrl },
-  };
+/** Sentinel used to clear a cached access token without removing the provider. */
+const CLEAR_TOKENS: OAuthTokens = { access_token: '', token_type: 'bearer' };
 
-  // ClientCredentialsProvider does not declare these optional OAuthClientProvider hooks;
-  // assign them so auth() skips RFC 9728 / AS rediscovery and omits the resource param.
-  const extensible = provider as ClientCredentialsProvider & OAuthClientProvider;
-  extensible.discoveryState = () => discoveryState;
-  extensible.saveDiscoveryState = (state: OAuthDiscoveryState) => {
-    discoveryState = state;
-  };
-  extensible.validateResourceURL = () => Promise.resolve(undefined);
-}
+/** Unpatched SDK auth; used by acquire so the module export patch cannot recurse. */
+const originalSdkAuth = sdkAuthFn;
 
 export function createTokenManager(config: Config, logger: Logger): TokenManager {
   let authMode: AuthMode = {
@@ -85,11 +59,12 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
   };
   let provider: ClientCredentialsProvider | undefined;
   let currentScopes: string | undefined;
-  let resourceMetadata: OAuthProtectedResourceMetadata | undefined;
-  let authServerMetadata: AuthorizationServerMetadata | undefined;
-  let refreshTimer: ReturnType<typeof setTimeout> | undefined;
-  let inflightRefresh: Promise<void> | undefined;
+  let discoverySnapshot: OAuthDiscoverySnapshot | undefined;
   let inflightStepUp: Promise<void> | undefined;
+  let inflightAcquire: Promise<void> | undefined;
+  let inflightRediscovery: Promise<void> | undefined;
+  let rediscoveryTimer: ReturnType<typeof setInterval> | undefined;
+  let authPatchInstalled = false;
 
   const timeoutFetch: typeof globalThis.fetch = (input, init) => {
     const signal = config.requestTimeoutMs
@@ -98,208 +73,94 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
     return fetch(input, { ...init, signal });
   };
 
+  const refresh = createTokenRefreshController(
+    config,
+    logger,
+    () => provider,
+    timeoutFetch,
+  );
+
   function createAuthenticatedProvider(scopes: string | undefined): ClientCredentialsProvider {
     const p = new ClientCredentialsProvider({
       clientId: config.clientId,
       clientSecret: config.clientSecret,
       ...(scopes ? { scope: scopes } : {}),
     });
-    installRefreshHook(p);
+    refresh.installRefreshHook(p);
     return p;
   }
 
-  function setupManualTokenEndpoint(): void {
-    const tokenEndpoint = config.tokenEndpoint!;
-    if (config.scopes) {
-      currentScopes = config.scopes;
-      logger.info('Using scopes from MCP_CC_PROXY_SCOPES', {
-        scopes: currentScopes,
-      });
-    } else {
-      currentScopes = undefined;
-    }
-
-    provider = createAuthenticatedProvider(currentScopes);
-    seedManualDiscoveryState(provider, tokenEndpoint, config.remoteMcpUrl);
-
-    authMode = { type: 'authenticated', provider };
-    logger.info('Using manual token endpoint (skipping OAuth discovery)', {
-      tokenEndpoint,
-      scopes: currentScopes ?? '(none)',
-    });
+  function applyDiscoveryResult(result: Awaited<ReturnType<typeof discoverOAuthForRemote>>): void {
+    authMode = result.authMode;
+    provider = result.provider;
+    currentScopes = result.currentScopes;
+    discoverySnapshot = result.snapshot;
   }
 
   async function discover(): Promise<void> {
-    if (config.tokenEndpoint) {
-      setupManualTokenEndpoint();
-      return;
-    }
-
-    const serverUrl = config.remoteMcpUrl;
-    logger.info('Starting OAuth discovery', { serverUrl });
-
-    let resourceDiscoveryFailed = false;
-    try {
-      resourceMetadata = await discoverOAuthProtectedResourceMetadata(serverUrl, {}, timeoutFetch);
-    } catch {
-      logger.debug('RFC 9728 protected resource metadata not found, trying AS discovery on server URL');
-      resourceMetadata = undefined;
-      resourceDiscoveryFailed = true;
-    }
-
-    const authServerUrl = resourceMetadata?.authorization_servers?.[0] ?? serverUrl;
-    logger.debug('Starting authorization server discovery', { authServerUrl });
-
-    let asDiscoveryFailed = false;
-    try {
-      authServerMetadata = await discoverAuthorizationServerMetadata(authServerUrl, { fetchFn: timeoutFetch });
-    } catch (err) {
-      logger.debug('Authorization server discovery failed', {
-        authServerUrl,
-        error: err instanceof Error ? err.message : String(err),
-      });
-      authServerMetadata = undefined;
-      asDiscoveryFailed = true;
-    }
-
-    if (!authServerMetadata) {
-      if (resourceDiscoveryFailed && asDiscoveryFailed) {
-        const detail =
-          'OAuth discovery failed (both resource and authorization server endpoints unreachable)';
-        const msg = formatProxyError('authentication', detail);
-        logger.warn(msg, { category: 'authentication' });
-        authMode = { type: 'discovery-failed', message: msg };
-        return;
-      }
-
-      logger.warn(
-        'Remote server does not announce auth requirements -- proxying without authentication',
-      );
-      authMode = { type: 'no-auth' };
-      return;
-    }
-
-    const grantTypes = authServerMetadata.grant_types_supported ?? ['authorization_code'];
-    if (!grantTypes.includes('client_credentials')) {
-      const detail =
-        `Remote MCP server requires authentication but its IdP does not support client_credentials grant. ` +
-        `Supported grants: [${grantTypes.join(', ')}]. This proxy only supports client_credentials.`;
-      const msg = formatProxyError('authentication', detail);
-      logger.error(msg, { category: 'authentication' });
-      authMode = { type: 'unsupported-grant', message: msg };
-      return;
-    }
-
-    if (config.scopes) {
-      currentScopes = config.scopes;
-      logger.info('Using scopes from MCP_CC_PROXY_SCOPES (overriding discovery)', {
-        scopes: currentScopes,
-      });
-    } else if (resourceMetadata?.scopes_supported?.length) {
-      currentScopes = resourceMetadata.scopes_supported.join(' ');
-    }
-
-    provider = createAuthenticatedProvider(currentScopes);
-
-    authMode = { type: 'authenticated', provider };
-    logger.info('OAuth discovery complete', {
-      tokenEndpoint: authServerMetadata.token_endpoint,
-      scopes: currentScopes ?? '(default)',
-    });
+    const result = await discoverOAuthForRemote(
+      config,
+      logger,
+      timeoutFetch,
+      createAuthenticatedProvider,
+    );
+    applyDiscoveryResult(result);
   }
 
-  function installRefreshHook(p: ClientCredentialsProvider): void {
-    const originalSaveTokens = p.saveTokens.bind(p);
-    p.saveTokens = (tokens: OAuthTokens) => {
-      originalSaveTokens(tokens);
-      scheduleRefresh(tokens.expires_in);
+  /**
+   * Coalesce concurrent auth()/token acquires for the shared provider (prefetch, refresh,
+   * step-up, rediscovery, and SDK 401→auth() across multi-session clients).
+   */
+  async function acquireAccessToken(
+    options?: Parameters<typeof originalSdkAuth>[1],
+  ): Promise<void> {
+    if (inflightAcquire) {
+      await inflightAcquire;
+      return;
+    }
+    if (!provider || authMode.type !== 'authenticated') {
+      return;
+    }
+    const p = provider;
+    inflightAcquire = (async () => {
+      const result = await originalSdkAuth(p, {
+        serverUrl: config.remoteMcpUrl,
+        fetchFn: timeoutFetch,
+        ...options,
+      });
+      if (result !== 'AUTHORIZED') {
+        throw new Error(formatProxyError('authentication', 'Token acquisition did not authorize'));
+      }
+    })().finally(() => {
+      inflightAcquire = undefined;
+    });
+    await inflightAcquire;
+  }
+
+  refresh.setAcquireFn(() => acquireAccessToken());
+
+  function installSdkAuthCoalesce(): void {
+    if (authPatchInstalled) return;
+    authPatchInstalled = true;
+    // CJS transports look up auth on the module exports object each call.
+    (sdkAuth as { auth: typeof originalSdkAuth }).auth = async (p, options) => {
+      if (provider && p === provider) {
+        await acquireAccessToken(options);
+        return 'AUTHORIZED';
+      }
+      return originalSdkAuth(p, options);
     };
   }
 
-  function scheduleRefresh(expiresIn?: number): void {
-    if (refreshTimer) {
-      clearTimeout(refreshTimer);
-      refreshTimer = undefined;
-    }
-    if (!expiresIn || expiresIn <= 0) return;
-
-    const refreshInMs = Math.max((expiresIn - config.refreshSkewSeconds) * 1000, 1000);
-    refreshTimer = setTimeout(() => void doProactiveRefresh(), refreshInMs);
-    logger.debug('Proactive token refresh scheduled', {
-      expiresInSeconds: expiresIn,
-      refreshInSeconds: Math.round(refreshInMs / 1000),
-    });
-  }
-
-  async function doProactiveRefresh(): Promise<void> {
-    if (inflightRefresh) return;
-    inflightRefresh = performRefresh().finally(() => { inflightRefresh = undefined; });
-    await inflightRefresh;
-  }
-
-  const MAX_REFRESH_RETRIES = 3;
-  let refreshRetryCount = 0;
-  let extendedRefreshAttempt = 0;
-  const EXTENDED_REFRESH_BASE_MS = 30_000;
-  const EXTENDED_REFRESH_MAX_MS = 300_000;
-
-  function getRetryIntervalMs(): number {
-    const skewMs = config.refreshSkewSeconds * 1000;
-    return Math.max(Math.min(5_000, Math.floor(skewMs / (MAX_REFRESH_RETRIES + 1))), 500);
-  }
-
-  function getExtendedRetryDelay(): number {
-    const exponential = Math.min(EXTENDED_REFRESH_BASE_MS * 2 ** extendedRefreshAttempt, EXTENDED_REFRESH_MAX_MS);
-    const jitter = Math.random() * exponential * 0.2;
-    return Math.round(exponential + jitter);
-  }
-
-  async function performRefresh(): Promise<void> {
-    if (!provider) return;
-    logger.debug('Starting proactive token refresh');
-    try {
-      const result = await auth(provider, { serverUrl: config.remoteMcpUrl, fetchFn: timeoutFetch });
-      if (result === 'AUTHORIZED') {
-        logger.info('Proactive token refresh successful');
-        refreshRetryCount = 0;
-        extendedRefreshAttempt = 0;
-      }
-    } catch (err) {
-      refreshRetryCount++;
-      if (refreshRetryCount < MAX_REFRESH_RETRIES) {
-        const retryMs = getRetryIntervalMs();
-        logger.warn('Proactive token refresh failed, scheduling retry', {
-          category: 'authentication',
-          error: err instanceof Error ? err.message : String(err),
-          attempt: refreshRetryCount,
-          maxAttempts: MAX_REFRESH_RETRIES,
-          retryInMs: retryMs,
-        });
-        refreshTimer = setTimeout(() => void doProactiveRefresh(), retryMs);
-      } else {
-        const extendedDelayMs = getExtendedRetryDelay();
-        logger.warn('Proactive token refresh exhausted fast retries, switching to extended backoff', {
-          category: 'authentication',
-          error: err instanceof Error ? err.message : String(err),
-          attempts: refreshRetryCount,
-          nextRetryMs: extendedDelayMs,
-        });
-        refreshRetryCount = 0;
-        extendedRefreshAttempt++;
-        refreshTimer = setTimeout(() => void doProactiveRefresh(), extendedDelayMs);
-      }
-    }
-  }
+  installSdkAuthCoalesce();
 
   async function prefetch(): Promise<void> {
     if (authMode.type !== 'authenticated' || !provider) {
       return;
     }
     try {
-      const result = await auth(provider, { serverUrl: config.remoteMcpUrl, fetchFn: timeoutFetch });
-      if (result === 'AUTHORIZED') {
-        logger.info('Token prefetch successful');
-      }
+      await acquireAccessToken();
+      logger.info('Token prefetch successful');
     } catch (err) {
       const message = errorDetail(err);
       logger.warn('Token prefetch failed', {
@@ -344,11 +205,7 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
     if (!provider) return;
     provider.clientMetadata.scope = scopes;
     // Restore the prior token (or clear) so a failed step-up cannot leave auth unusable.
-    provider.saveTokens(
-      tokens && tokens.access_token
-        ? tokens
-        : { access_token: '', token_type: 'bearer' },
-    );
+    provider.saveTokens(tokens && tokens.access_token ? tokens : CLEAR_TOKENS);
   }
 
   /**
@@ -386,17 +243,9 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
             scopesSnapshot = currentScopes;
             provider.clientMetadata.scope = scopesSnapshot;
             // Clear the cached token so auth() fetches with the updated clientMetadata.scope.
-            provider.saveTokens({ access_token: '', token_type: 'bearer' });
+            provider.saveTokens(CLEAR_TOKENS);
             try {
-              const result = await auth(provider, {
-                serverUrl: config.remoteMcpUrl,
-                fetchFn: timeoutFetch,
-              });
-              if (result !== 'AUTHORIZED') {
-                throw new Error(
-                  formatProxyError('authentication', 'Scope step-up auth did not authorize'),
-                );
-              }
+              await acquireAccessToken();
             } catch (err) {
               restoreScopesAndTokens(baselineScopes, baselineTokens);
               throw err;
@@ -424,6 +273,135 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
     });
   }
 
+  function startRediscoverySchedule(): void {
+    if (rediscoveryTimer) return;
+    if (config.tokenEndpoint) return;
+    if (config.oauthRediscoverySeconds <= 0) return;
+
+    const intervalMs = config.oauthRediscoverySeconds * 1000;
+    rediscoveryTimer = setInterval(() => {
+      void rediscoverOAuthMetadata();
+    }, intervalMs);
+    // Allow the process to exit naturally in tests / short-lived runs.
+    rediscoveryTimer.unref?.();
+    logger.info('OAuth rediscovery schedule started', {
+      intervalSeconds: config.oauthRediscoverySeconds,
+    });
+  }
+
+  function stopRediscoverySchedule(): void {
+    if (rediscoveryTimer) {
+      clearInterval(rediscoveryTimer);
+      rediscoveryTimer = undefined;
+    }
+  }
+
+  async function rediscoverOAuthMetadata(): Promise<void> {
+    if (config.tokenEndpoint) {
+      logger.debug('Skipping OAuth rediscovery (manual token endpoint configured)');
+      return;
+    }
+    if (inflightRediscovery) {
+      await inflightRediscovery;
+      return;
+    }
+
+    inflightRediscovery = (async () => {
+      logger.debug('Starting OAuth rediscovery');
+      const previousSnapshot = discoverySnapshot;
+      const previousProvider = provider;
+      const previousScopes = currentScopes;
+      const previousMode = authMode;
+      const previousTokens = previousProvider
+        ? snapshotTokens(previousProvider.tokens())
+        : undefined;
+
+      let result: Awaited<ReturnType<typeof discoverOAuthForRemote>>;
+      try {
+        result = await discoverOAuthForRemote(
+          config,
+          logger,
+          timeoutFetch,
+          createAuthenticatedProvider,
+        );
+      } catch (err) {
+        logger.warn('OAuth rediscovery failed; keeping previous discovery and token', {
+          category: 'authentication',
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return;
+      }
+
+      // Dual well-known failure surfaces as discovery-failed; do not brick a working token.
+      if (
+        result.authMode.type === 'discovery-failed' &&
+        previousSnapshot &&
+        previousSnapshot.authModeType !== 'discovery-failed'
+      ) {
+        logger.warn('OAuth rediscovery failed; keeping previous discovery and token', {
+          category: 'authentication',
+          error: result.authMode.message,
+        });
+        return;
+      }
+
+      // Partial failure (e.g. PRM ok, AS .well-known down) is reported as no-auth at discovery
+      // time. At runtime that must not downgrade an authenticated process and clear token gating.
+      if (result.authMode.type === 'no-auth' && previousMode.type === 'authenticated') {
+        logger.warn(
+          'OAuth rediscovery reported no-auth while previously authenticated; keeping previous discovery and token',
+          { category: 'authentication' },
+        );
+        return;
+      }
+
+      if (!previousSnapshot || !isSignificantOAuthChange(previousSnapshot, result.snapshot)) {
+        // Keep current provider/token; discard the freshly built provider from rediscovery.
+        logger.info('OAuth rediscovery unchanged');
+        // Reset timer cadence after a successful pass.
+        stopRediscoverySchedule();
+        startRediscoverySchedule();
+        return;
+      }
+
+      const changes = describeSignificantOAuthChanges(previousSnapshot, result.snapshot);
+      logger.info('OAuth rediscovery detected significant change; reacquiring token', {
+        changes,
+      });
+
+      refresh.cancelRefreshTimer();
+      applyDiscoveryResult(result);
+
+      if (authMode.type === 'authenticated') {
+        try {
+          await acquireAccessToken();
+          logger.info('Token reacquired after OAuth rediscovery');
+        } catch (err) {
+          logger.warn('Token reacquire after OAuth rediscovery failed', {
+            category: 'authentication',
+            error: errorDetail(err),
+          });
+          // Leave auth gap behavior to runtime request gating / proactive refresh.
+        }
+      } else if (
+        previousMode.type === 'authenticated' &&
+        previousProvider &&
+        previousTokens?.access_token
+      ) {
+        // Mode flipped away from authenticated; drop the old token.
+        void previousScopes;
+        previousProvider.saveTokens(CLEAR_TOKENS);
+      }
+
+      stopRediscoverySchedule();
+      startRediscoverySchedule();
+    })().finally(() => {
+      inflightRediscovery = undefined;
+    });
+
+    await inflightRediscovery;
+  }
+
   async function waitUntilAuthReady(deadlineMs: number): Promise<void> {
     let attempt = 0;
     while (true) {
@@ -436,6 +414,7 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
 
       if (mode.type === 'no-auth') {
         logger.info('Auth readiness: no-auth mode (token not required)');
+        startRediscoverySchedule();
         return;
       }
 
@@ -457,6 +436,7 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
         }
         if (hasUsableAccessToken()) {
           logger.info('Auth readiness: usable access token acquired');
+          startRediscoverySchedule();
           return;
         }
       }
@@ -487,20 +467,15 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
   }
 
   function invalidate(): void {
-    if (refreshTimer) {
-      clearTimeout(refreshTimer);
-      refreshTimer = undefined;
-    }
+    refresh.cancelRefreshTimer();
     if (provider) {
-      provider.saveTokens({ access_token: '', token_type: 'bearer' });
+      provider.saveTokens(CLEAR_TOKENS);
     }
   }
 
   function stop(): void {
-    if (refreshTimer) {
-      clearTimeout(refreshTimer);
-      refreshTimer = undefined;
-    }
+    refresh.cancelRefreshTimer();
+    stopRediscoverySchedule();
   }
 
   function getAuthProvider(): OAuthClientProvider | undefined {
@@ -525,6 +500,7 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
     getCurrentScopes,
     stepUpScopes,
     getScopeStepUpFetch,
+    rediscoverOAuthMetadata,
     invalidate,
     stop,
   };
