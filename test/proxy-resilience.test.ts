@@ -96,6 +96,11 @@ function createMockConfig(overrides?: Partial<Config>): Config {
     requestTimeoutMs: 30000,
     startupTimeoutMs: 60000,
     capabilitiesPollSeconds: 0,
+    transport: 'stdio',
+    listenHost: '127.0.0.1',
+    listenPort: 8080,
+    listenPath: '/mcp',
+    oauthRediscoverySeconds: 3600,
     debug: false,
     ...overrides,
   };
@@ -123,6 +128,7 @@ function createMockTokenManager(mode: AuthMode = { type: 'authenticated', provid
     getCurrentScopes: vi.fn().mockReturnValue(undefined),
     stepUpScopes: vi.fn().mockResolvedValue(undefined),
     getScopeStepUpFetch: vi.fn().mockReturnValue(fetch),
+    rediscoverOAuthMetadata: vi.fn().mockResolvedValue(undefined),
     invalidate: vi.fn(),
     stop: vi.fn(),
   };
@@ -155,9 +161,9 @@ describe('Proxy resilience', () => {
       const logger = createMockLogger();
       const tokenManager = createMockTokenManager();
 
-      const { createProxy } = await import('../src/proxy.js');
+      const { createStdioProxy } = await import('../src/proxy-stdio.js');
       await expect(
-        createProxy(config, tokenManager, logger, Date.now() + 60_000),
+        createStdioProxy(config, tokenManager, logger, Date.now() + 60_000),
       ).rejects.toThrow(
         /Unrecoverable OAuth misconfiguration at the identity provider \(IdP\): Invalid scopes: api\.graphql/,
       );
@@ -194,9 +200,9 @@ describe('Proxy resilience', () => {
       const logger = createMockLogger();
       const tokenManager = createMockTokenManager();
 
-      const { createProxy } = await import('../src/proxy.js');
+      const { createStdioProxy } = await import('../src/proxy-stdio.js');
       await expect(
-        createProxy(config, tokenManager, logger, Date.now() + 60_000),
+        createStdioProxy(config, tokenManager, logger, Date.now() + 60_000),
       ).rejects.toThrow(
         /Unrecoverable OAuth misconfiguration at the remote MCP server: Unauthorized/,
       );
@@ -227,9 +233,9 @@ describe('Proxy resilience', () => {
       const logger = createMockLogger();
       const tokenManager = createMockTokenManager();
 
-      const { createProxy } = await import('../src/proxy.js');
+      const { createStdioProxy } = await import('../src/proxy-stdio.js');
       await expect(
-        createProxy(config, tokenManager, logger, Date.now() + 80),
+        createStdioProxy(config, tokenManager, logger, Date.now() + 80),
       ).rejects.toThrow(/Remote MCP server unreachable within startup timeout/);
 
       expect(logger.warn).toHaveBeenCalledWith(
@@ -249,8 +255,8 @@ describe('Proxy resilience', () => {
       const logger = createMockLogger();
       const tokenManager = createMockTokenManager();
 
-      const { createProxy } = await import('../src/proxy.js');
-      proxyHandle = await createProxy(config, tokenManager, logger, Date.now() + 5000);
+      const { createStdioProxy } = await import('../src/proxy-stdio.js');
+      proxyHandle = await createStdioProxy(config, tokenManager, logger, Date.now() + 5000);
 
       expect(logger.warn).toHaveBeenCalledWith(
         'Remote MCP server unreachable during discovery, retrying',
@@ -297,8 +303,8 @@ describe('Proxy resilience', () => {
       const logger = createMockLogger();
       const tokenManager = createMockTokenManager();
 
-      const { createProxy } = await import('../src/proxy.js');
-      proxyHandle = await createProxy(config, tokenManager, logger);
+      const { createStdioProxy } = await import('../src/proxy-stdio.js');
+      proxyHandle = await createStdioProxy(config, tokenManager, logger);
 
       endClient = new Client(
         { name: 'test-client', version: '2.5.0' },
@@ -340,8 +346,8 @@ describe('Proxy resilience', () => {
       const logger = createMockLogger();
       const tokenManager = createMockTokenManager();
 
-      const { createProxy } = await import('../src/proxy.js');
-      proxyHandle = await createProxy(config, tokenManager, logger);
+      const { createStdioProxy } = await import('../src/proxy-stdio.js');
+      proxyHandle = await createStdioProxy(config, tokenManager, logger);
 
       endClient = new Client(
         { name: 'test-client', version: '2.5.0' },
@@ -369,8 +375,8 @@ describe('Proxy resilience', () => {
       const logger = createMockLogger();
       const tokenManager = createMockTokenManager();
 
-      const { createProxy } = await import('../src/proxy.js');
-      proxyHandle = await createProxy(config, tokenManager, logger);
+      const { createStdioProxy } = await import('../src/proxy-stdio.js');
+      proxyHandle = await createStdioProxy(config, tokenManager, logger);
 
       endClient = new Client(
         { name: 'test-client', version: '2.5.0' },

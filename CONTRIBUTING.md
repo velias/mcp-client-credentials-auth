@@ -109,6 +109,16 @@ cp .env.example .env    # Edit with your remote MCP server + OAuth details
 }
 ```
 
+### Building the container image (optional)
+
+On-premises HTTP mode ships a GHCR image on release tags. For a local image build (Podman is used in examples; `docker` works the same):
+
+```bash
+podman build -t mcp-client-credentials-auth:local .
+```
+
+Image defaults set `MCP_CC_PROXY_TRANSPORT=http` and `MCP_CC_PROXY_LISTEN_HOST=0.0.0.0`. See README [On-premises HTTP deployment](README.md#on-premises-http-deployment-alternative). Stdio remains the primary local development path.
+
 ### Running Tests
 
 ```bash

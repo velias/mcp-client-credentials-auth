@@ -36,6 +36,9 @@ add context, highlight important changes, or remove noise.
    - Run lint, test, build
    - Publish to npm via OIDC Trusted Publishing (no token needed)
    - Create a GitHub Release with auto-generated notes
+   - Build and push a container image to `ghcr.io/velias/mcp-client-credentials-auth`
+     with tags `X.Y.Z`, `X.Y`, `X`, and `latest` (uses `GITHUB_TOKEN` /
+     `packages: write`; no extra secret)
 6. (Optional) Edit the GitHub Release notes in the UI to curate
 
 ## Version guidance
@@ -127,13 +130,14 @@ npm login && npm publish --access public
 
 ## Recovery: re-run a failed release
 
-If a release workflow fails (check the `npm publish` step logs):
+If a release workflow fails (check the `npm publish` or `docker` job logs):
 
-1. Fix the underlying issue (e.g. Trusted Publishing misconfiguration, or
-   npm outage)
+1. Fix the underlying issue (e.g. Trusted Publishing misconfiguration,
+   npm outage, or GHCR push permission)
 2. Go to the failed workflow run in GitHub Actions
 3. Click **"Re-run failed jobs"**
 
 The git tag and version bump are already in place, so no need to re-tag. The
 GitHub Release may or may not have been created depending on which step failed;
-if it was created, it stays; if not, the re-run will create it.
+if it was created, it stays; if not, the re-run will create it. The docker job
+can be re-run independently if npm publish already succeeded.
