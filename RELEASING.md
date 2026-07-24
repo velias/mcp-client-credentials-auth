@@ -22,7 +22,7 @@ add context, highlight important changes, or remove noise.
 
 - Push access to `main`
 - [GitHub CLI](https://cli.github.com/) (`gh`) installed and authenticated
-  (`gh auth login`)
+  (`gh auth login`) -- used by `npm run changelog` to fetch release notes
 - **Trusted Publishing** configured on npmjs.com (see below)
 
 ## Steps
@@ -40,6 +40,9 @@ add context, highlight important changes, or remove noise.
      with tags `X.Y.Z`, `X.Y`, `X`, and `latest` (uses `GITHUB_TOKEN` /
      `packages: write`; no extra secret)
 6. (Optional) Edit the GitHub Release notes in the UI to curate
+7. Run `npm run changelog` to regenerate `CHANGELOG.md` from all GitHub
+   Releases, then commit and push the result. This can also be re-run later
+   if you edit release notes after the fact.
 
 ## Version guidance
 
