@@ -34,14 +34,14 @@ src/
   token-refresh.ts           # Proactive IdP token refresh timer/backoff
   scope-step-up.ts           # 403 insufficient_scope fetch workaround (SDK #2255/#1582)
 test/
-  config.test.ts             # Config parsing, validation, defaults, transport/listen
+  config.test.ts             # Config parsing, validation, defaults, transport/listen, auditCalls
   errors.test.ts             # Error classification and mcp-client-credentials-auth [category] format
   token-manager.test.ts      # Discovery, auth modes, prefetch, refresh, step-up, rediscovery
   scope-step-up.test.ts      # Scope merge + step-up fetch wrapper
-  proxy.test.ts              # Stdio E2E with in-memory MCP transports, reconnection
+  proxy.test.ts              # Stdio E2E with in-memory MCP transports, reconnection, call audit
   proxy-advanced.test.ts     # Auth usability gating, remote error wrapping, polling
   proxy-resilience.test.ts  # Fail-closed Phase 1 startup, Phase 3 reconnect, dynamic auth
-  proxy-http.test.ts        # HTTP health probes, session lifecycle, no process.exit on disconnect
+  proxy-http.test.ts        # HTTP health probes, session lifecycle, audit sessionId, no process.exit on disconnect
   logger.test.ts             # Log output formatting, levels, secret redaction
 ```
 
@@ -52,6 +52,7 @@ Naming: `remote-*` = outbound toward the remote MCP (connect, MCP discovery, OAu
 - **stdio reserved for JSON-RPC** -- all proxy logging goes to stderr (`logger.ts`), never stdout. The MCP protocol's own `notifications/message` logging from the remote server passes through to the local client via fallback handlers. The proxy does not inject its own MCP-level log notifications because it mirrors the remote server's declared capabilities (including whether `logging` is supported).
 - **Fail-closed startup** -- do not bind local transport until auth is ready (`no-auth`, or `authenticated` with a usable access token) **and** Phase 1 remote discovery succeeds. `waitUntilAuthReady()` and required Phase 1 share one wall-clock budget (`startupTimeoutMs` / `MCP_CC_PROXY_STARTUP_TIMEOUT_MS`). On expiry, `unsupported-grant`, or unrecoverable auth errors (`isUnrecoverableStartupAuthError`), exit non-zero immediately (no startup retries). `formatUnrecoverableOAuthMisconfig(detail, source)` names the failure site: `idp` (IdP rejected the token request) vs `mcp-server` (remote MCP rejected the Bearer token), and tells the operator to contact the MCP server provider. Transient network/remote outages retry until the deadline. No fake default capabilities.
 - **Local transport** -- `MCP_CC_PROXY_TRANSPORT=stdio|http` (default `stdio`). Stdio: one session; stdin close exits. HTTP: Express + `StreamableHTTPServerTransport` multi-session; process stays up across session connect/disconnect; `/health/live` + `/health/ready` (ready returns 503 while shutting down); no inbound auth in v1 (document reverse-proxy HTTPS). Shared process-level `TokenManager` / Bearer token across sessions. Idle sessions are evicted after `MCP_CC_PROXY_HTTP_SESSION_IDLE_SECONDS` (default 1800; `0` disables) based on last inbound MCP request; further requests with that `mcp-session-id` get `404 Session not found` and the client must re-`initialize` (proxy does not auto-create a session for an unknown id).
+- **Call audit log** -- when `MCP_CC_PROXY_AUDIT_CALLS` is on (default off for stdio, on for http), audited client→server tools/resources/prompts invoke/discovery and server→client `sampling/createMessage` / `elicitation/create` each emit one INFO stderr line (`msg` = JSON-RPC method) with `outcome`, `durationMs`, optional identity (`tool` / `uri` / `prompt`), HTTP `sessionId`, and on failure `error_category` + `error`. Arguments, sampling messages, and elicitation bodies are never logged. `resources/read` logs the full client `uri` (query/userinfo/fragment included; no strip/redact); document as access-log retention risk when URIs embed secrets. Forwarding stays allowlist-free; only audit emission uses a small method set. Proxy-internal capability polls do not go through the local handler and are not audited.
 - **Two-phase connection** -- Phase 1 discovery (proxy identity) proves remote reachability and reads server info/capabilities before local bind; after the local client finishes `initialize`, Phase 3 reconnects with the local client's actual identity/capabilities (per session in HTTP mode)
 - **Protocol-version agnostic** -- uses SDK fallback handlers for bidirectional pass-through
 - **No hardcoded method tables** -- all 4 message flows use `fallbackRequestHandler`/`fallbackNotificationHandler`

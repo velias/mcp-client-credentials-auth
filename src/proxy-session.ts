@@ -24,6 +24,23 @@ import {
 
 const permissiveSchema = z.object({}).passthrough();
 
+/**
+ * Audited JSON-RPC methods when MCP_CC_PROXY_AUDIT_CALLS is on.
+ * Client→server: tools/resources/prompts invoke + discovery.
+ * Server→client: sampling + elicitation (no message/body identity fields).
+ */
+const AUDITED_METHODS = new Set([
+  'tools/call',
+  'tools/list',
+  'resources/read',
+  'resources/list',
+  'resources/templates/list',
+  'prompts/get',
+  'prompts/list',
+  'sampling/createMessage',
+  'elicitation/create',
+]);
+
 export interface ProxySession {
   localServer: Server;
   close(): Promise<void>;
@@ -37,6 +54,11 @@ export interface CreateProxySessionOptions {
    * `close` — tear down this session only; keep the process up (HTTP mode).
    */
   onLocalDisconnect: 'exit' | 'close';
+  /**
+   * HTTP mode: mutable holder filled with the local `mcp-session-id` once
+   * `onsessioninitialized` runs. Stdio omits this; audit lines then omit `sessionId`.
+   */
+  localSessionId?: { current?: string };
 }
 
 export function createProxySession(
@@ -77,6 +99,30 @@ export function createProxySession(
     return client;
   }
 
+  function emitCallAudit(
+    method: string,
+    started: number,
+    identity: Record<string, unknown>,
+    result:
+      | { outcome: 'ok' }
+      | { outcome: 'error'; error_category: string; error: string },
+  ): void {
+    const meta: Record<string, unknown> = {
+      ...identity,
+      outcome: result.outcome,
+      durationMs: Date.now() - started,
+    };
+    const sessionId = options.localSessionId?.current;
+    if (sessionId) {
+      meta.sessionId = sessionId;
+    }
+    if (result.outcome === 'error') {
+      meta.error_category = result.error_category;
+      meta.error = result.error;
+    }
+    logger.info(method, meta);
+  }
+
   function wireRemoteHandlers(client: Client): void {
     client.fallbackNotificationHandler = async (notification) => {
       logger.debug('Forwarding server notification', { method: notification.method });
@@ -88,10 +134,27 @@ export function createProxySession(
 
     client.fallbackRequestHandler = async (request) => {
       logger.debug('Forwarding server request to local client', { method: request.method });
-      return localServer.request(
-        { method: request.method, params: request.params },
-        permissiveSchema,
-      );
+      const shouldAudit = config.auditCalls && AUDITED_METHODS.has(request.method);
+      const started = shouldAudit ? Date.now() : 0;
+      try {
+        const response = await localServer.request(
+          { method: request.method, params: request.params },
+          permissiveSchema,
+        );
+        if (shouldAudit) {
+          emitCallAudit(request.method, started, {}, { outcome: 'ok' });
+        }
+        return response;
+      } catch (err) {
+        if (shouldAudit) {
+          emitCallAudit(request.method, started, {}, {
+            outcome: 'error',
+            error_category: classifyError(err),
+            error: errorDetail(err),
+          });
+        }
+        throw err;
+      }
     };
   }
 
@@ -338,9 +401,30 @@ export function createProxySession(
     );
   }
 
+  function auditIdentity(
+    method: string,
+    params: Record<string, unknown> | undefined,
+  ): Record<string, unknown> {
+    if (method === 'tools/call') {
+      return { tool: typeof params?.name === 'string' ? params.name : 'unknown' };
+    }
+    if (method === 'resources/read') {
+      return { uri: typeof params?.uri === 'string' ? params.uri : 'unknown' };
+    }
+    if (method === 'prompts/get') {
+      return { prompt: typeof params?.name === 'string' ? params.name : 'unknown' };
+    }
+    return {};
+  }
+
   // Flow 1: Client->Server REQUESTS
   localServer.fallbackRequestHandler = async (request) => {
     await readyPromise;
+
+    const shouldAudit = config.auditCalls && AUDITED_METHODS.has(request.method);
+    const started = shouldAudit ? Date.now() : 0;
+    const sanitizedParams = sanitizeMeta(request.params);
+    const identity = shouldAudit ? auditIdentity(request.method, sanitizedParams) : {};
 
     const authMode = tokenManager.getAuthMode();
     if (authMode.type === 'authenticated' && !tokenManager.hasUsableAccessToken()) {
@@ -348,13 +432,22 @@ export function createProxySession(
         category: 'authentication',
         method: request.method,
       });
+      if (shouldAudit) {
+        emitCallAudit(request.method, started, identity, {
+          outcome: 'error',
+          error_category: 'authentication',
+          error: 'no usable access token',
+        });
+      }
       throw toClientError('authentication', 'no usable access token');
     }
 
-    const sanitizedParams = sanitizeMeta(request.params);
-
     try {
-      return await forwardRequest(request.method, sanitizedParams);
+      const response = await forwardRequest(request.method, sanitizedParams);
+      if (shouldAudit) {
+        emitCallAudit(request.method, started, identity, { outcome: 'ok' });
+      }
+      return response;
     } catch (err) {
       if (isStaleRemoteSessionError(err)) {
         const recovered = await recoverStaleRemoteSession({
@@ -363,7 +456,11 @@ export function createProxySession(
         });
         if (recovered) {
           try {
-            return await forwardRequest(request.method, sanitizedParams);
+            const response = await forwardRequest(request.method, sanitizedParams);
+            if (shouldAudit) {
+              emitCallAudit(request.method, started, identity, { outcome: 'ok' });
+            }
+            return response;
           } catch (retryErr) {
             const category = classifyError(retryErr);
             logger.warn('Remote request failed after session reacquire', {
@@ -371,8 +468,22 @@ export function createProxySession(
               method: request.method,
               error: errorDetail(retryErr),
             });
+            if (shouldAudit) {
+              emitCallAudit(request.method, started, identity, {
+                outcome: 'error',
+                error_category: category,
+                error: errorDetail(retryErr),
+              });
+            }
             throw wrapCaughtError(retryErr);
           }
+        }
+        if (shouldAudit) {
+          emitCallAudit(request.method, started, identity, {
+            outcome: 'error',
+            error_category: 'connection',
+            error: 'temporarily unavailable (reconnecting)',
+          });
         }
         throw toClientError('connection', 'temporarily unavailable (reconnecting)');
       }
@@ -383,6 +494,13 @@ export function createProxySession(
         method: request.method,
         error: errorDetail(err),
       });
+      if (shouldAudit) {
+        emitCallAudit(request.method, started, identity, {
+          outcome: 'error',
+          error_category: category,
+          error: errorDetail(err),
+        });
+      }
       throw wrapCaughtError(err);
     }
   };

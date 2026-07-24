@@ -36,6 +36,11 @@ export const ConfigSchema = z.object({
   oauthRediscoverySeconds: z.number().int().min(0).default(3600),
   /** HTTP mode: evict sessions with no inbound MCP traffic for this long. `0` disables. */
   httpSessionIdleSeconds: z.number().int().min(0).default(1800),
+  /**
+   * Audit tools/resources/prompts invoke + discovery to stderr.
+   * Resolved in loadConfig: default false for stdio, true for http when env unset.
+   */
+  auditCalls: z.boolean(),
 });
 
 export type Config = z.infer<typeof ConfigSchema>;
@@ -52,6 +57,7 @@ function parseNumber(value: string | undefined): number | undefined {
 }
 
 export function loadConfig(): Config {
+  const transport = process.env.MCP_CC_PROXY_TRANSPORT || 'stdio';
   const raw = {
     remoteMcpUrl: process.env.MCP_CC_PROXY_REMOTE_MCP_URL,
     clientId: process.env.MCP_CC_PROXY_CLIENT_ID,
@@ -77,6 +83,9 @@ export function loadConfig(): Config {
     httpSessionIdleSeconds: parseNumber(
       process.env.MCP_CC_PROXY_HTTP_SESSION_IDLE_SECONDS,
     ),
+    auditCalls: process.env.MCP_CC_PROXY_AUDIT_CALLS
+      ? parseBool(process.env.MCP_CC_PROXY_AUDIT_CALLS)
+      : transport === 'http',
   };
 
   const result = ConfigSchema.safeParse(raw);

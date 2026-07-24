@@ -68,6 +68,7 @@ All configuration via `MCP_CC_PROXY_*` environment variables:
 | `MCP_CC_PROXY_LISTEN_PORT` | No | `8080` | HTTP bind port (HTTP mode only) |
 | `MCP_CC_PROXY_LISTEN_PATH` | No | `/mcp` | MCP Streamable HTTP mount path (HTTP mode only) |
 | `MCP_CC_PROXY_HTTP_SESSION_IDLE_SECONDS` | No | `1800` | HTTP mode: close sessions with no inbound MCP traffic for this long (`0` disables). See [On-premises HTTP deployment](#on-premises-http-deployment-alternative). |
+| `MCP_CC_PROXY_AUDIT_CALLS` | No | `false` (stdio), `true` (http) | Emit per-call usage audit lines to stderr. See [Call audit log](#call-audit-log). |
 | `MCP_CC_PROXY_OAUTH_REDISCOVERY_SECONDS` | No | `3600` | Interval to re-fetch OAuth PRM/AS metadata (both transports). `0` disables the timer only. See [OAuth discovery and scopes at runtime](#oauth-discovery-and-scopes-at-runtime). |
 
 ### Servers without OAuth discovery
@@ -178,7 +179,7 @@ Beyond the HTTPS layout and [health probes](#health-probes) above:
 
 - **Reachability is authorization** — anyone who can open an MCP session (including via a mis-published `:8080` or the container's `0.0.0.0` bind) gets the full service-account privilege. Keep the listener on a private network only.
 - **One shared machine identity** — all sessions share the same Bearer token and scope set (including step-up). Session IDs are capability-like on the private hop. Not multi-tenant; use separate deployments per trust boundary.
-- **Credentials and logs** — env-held secrets are a shared blast radius; prefer vault/`--env-file` (see [Security](#security)) and rotate on compromise. Protect log sinks (URLs/client names; secrets are redacted). Keep images and the pinned base digest updated.
+- **Credentials and logs** — env-held secrets are a shared blast radius; prefer vault/`--env-file` (see [Security](#security)) and rotate on compromise. Protect log sinks (URLs/client names; secrets are redacted). When [call audit](#call-audit-log) is on, `resources/read` logs the full `uri` (including embedded credentials in query/userinfo if present). Keep images and the pinned base digest updated.
 
 ### Using an MCP gateway (optional hardening)
 
@@ -413,6 +414,27 @@ During `initialize`, the auth proxy forwards identity and capabilities in both d
 Your MCP client sees the remote server's real name. The remote sees a name like `cursor-vscode via mcp-client-credentials-auth v0.2.0` with the client's version. Local capabilities (`sampling`, `roots`, `elicitation`, etc.) are forwarded so server-to-client features work through the proxy.
 
 The proxy also declares the [`io.modelcontextprotocol/oauth-client-credentials`](https://modelcontextprotocol.io/extensions/auth/oauth-client-credentials) extension on both connections so the remote can apply machine-to-machine policies.
+
+## Call audit log
+
+When `MCP_CC_PROXY_AUDIT_CALLS` is enabled, the proxy writes one INFO stderr line per audited MCP request. Defaults are off for stdio and on for HTTP; set the env var explicitly to override either default.
+
+**Client → server:** `tools/call`, `tools/list`, `resources/read`, `resources/list`, `resources/templates/list`, `prompts/get`, `prompts/list`.
+
+**Server → client:** `sampling/createMessage`, `elicitation/create`.
+
+Each line uses the JSON-RPC method as `msg`, plus structured meta:
+
+- always: `outcome` (`ok` or `error`), `durationMs`
+- when applicable: `tool`, `uri`, or `prompt` (invoke identity only)
+- HTTP mode: `sessionId` (local `mcp-session-id`)
+- on failure: `error_category` (`authentication` / `connection` / `remote`) and `error`
+
+Arguments, sampling message contents, and elicitation bodies are never logged. Unrelated protocol methods (`initialize`, `ping`, `roots/list`, etc.) are not audited. Proxy-internal capability polling is not audited.
+
+**URI privacy:** for `resources/read`, the audit line records the full client-supplied `uri` (including query string, userinfo, and fragment). If resource URIs embed credentials (presigned URLs, API keys in query params, etc.), those values reach stderr and any log sink that collects it. Treat audit logs like access logs: restrict retention and who can read them, or disable audit (`MCP_CC_PROXY_AUDIT_CALLS=false`) when URIs are sensitive. The proxy does not strip or redact URI components.
+
+Filter audit lines with `outcome=` or an exact method such as `msg="tools/call"`.
 
 ## Known Issues
 

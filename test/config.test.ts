@@ -169,6 +169,25 @@ describe('Config', () => {
     expect(config.listenPath).toBe('/mcp');
     expect(config.oauthRediscoverySeconds).toBe(3600);
     expect(config.httpSessionIdleSeconds).toBe(1800);
+    expect(config.auditCalls).toBe(false);
+  });
+
+  it('defaults auditCalls to true for http transport', () => {
+    setRequiredEnv();
+    process.env.MCP_CC_PROXY_TRANSPORT = 'http';
+    const config = loadConfig();
+    expect(config.auditCalls).toBe(true);
+  });
+
+  it('allows MCP_CC_PROXY_AUDIT_CALLS to override transport default', () => {
+    setRequiredEnv();
+    process.env.MCP_CC_PROXY_TRANSPORT = 'http';
+    process.env.MCP_CC_PROXY_AUDIT_CALLS = 'false';
+    expect(loadConfig().auditCalls).toBe(false);
+
+    delete process.env.MCP_CC_PROXY_TRANSPORT;
+    process.env.MCP_CC_PROXY_AUDIT_CALLS = 'true';
+    expect(loadConfig().auditCalls).toBe(true);
   });
 
   it('allows httpSessionIdleSeconds of 0', () => {

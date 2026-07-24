@@ -102,6 +102,7 @@ function createMockConfig(overrides?: Partial<Config>): Config {
     listenPath: '/mcp',
     oauthRediscoverySeconds: 3600,
     httpSessionIdleSeconds: 1800,
+    auditCalls: false,
     debug: false,
     ...overrides,
   };

@@ -78,6 +78,7 @@ function createMockConfig(overrides?: Partial<Config>): Config {
     listenPath: '/mcp',
     oauthRediscoverySeconds: 0,
     httpSessionIdleSeconds: 0,
+    auditCalls: true,
     debug: false,
     ...overrides,
   };
@@ -342,5 +343,47 @@ describe('HTTP proxy (createHttpProxy)', () => {
       jsonrpc: '2.0',
       error: { code: -32001, message: 'Session not found' },
     });
+  });
+
+  it('audits tools/list with local sessionId', async () => {
+    const config = createMockConfig({ auditCalls: true });
+    logger = createMockLogger();
+    const tokenManager = createMockTokenManager();
+    const { createHttpProxy } = await import('../src/proxy-http.js');
+    proxyHandle = await createHttpProxy(config, tokenManager, logger);
+
+    const url = new URL(`http://127.0.0.1:${proxyHandle.listenPort}${config.listenPath}`);
+    const client = new Client(
+      { name: 'http-audit-client', version: '1.0.0' },
+      { capabilities: {} },
+    );
+    const transport = new StreamableHTTPClientTransport(url);
+    await client.connect(transport);
+    const sid = transport.sessionId;
+    expect(sid).toBeTruthy();
+
+    // Wait for Phase 3 remote ready before listing.
+    await new Promise((r) => setTimeout(r, 50));
+    const upstream = upstreamServers[upstreamServers.length - 1];
+    upstream.fallbackRequestHandler = async (request) => {
+      if (request.method === 'tools/list') {
+        return { tools: [] };
+      }
+      return {};
+    };
+
+    vi.mocked(logger.info).mockClear();
+    await client.listTools();
+
+    expect(logger.info).toHaveBeenCalledWith(
+      'tools/list',
+      expect.objectContaining({
+        sessionId: sid,
+        outcome: 'ok',
+        durationMs: expect.any(Number),
+      }),
+    );
+
+    await client.close().catch(() => {});
   });
 });
