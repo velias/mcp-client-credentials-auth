@@ -38,10 +38,19 @@ export interface TokenManager {
   getCurrentScopes(): string | undefined;
   stepUpScopes(challengeScopes: string): Promise<void>;
   getScopeStepUpFetch(): FetchLike;
-  rediscoverOAuthMetadata(): Promise<void>;
+  /**
+   * Re-fetch OAuth PRM/AS metadata.
+   * Without `force`, skips when a rediscovery ran within the reconnect debounce window
+   * (used after remote reconnect to avoid well-known spam during flaps).
+   * Timer-driven rediscovery should pass `{ force: true }`.
+   */
+  rediscoverOAuthMetadata(options?: { force?: boolean }): Promise<void>;
   invalidate(): void;
   stop(): void;
 }
+
+/** Minimum gap between non-forced (reconnect) rediscovery attempts. */
+const REDISCOVERY_RECONNECT_MIN_INTERVAL_MS = 5 * 60 * 1000;
 
 const AUTH_RETRY_BASE_MS = 5000;
 const AUTH_RETRY_MAX_MS = 60000;
@@ -64,6 +73,8 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
   let inflightAcquire: Promise<void> | undefined;
   let inflightRediscovery: Promise<void> | undefined;
   let rediscoveryTimer: ReturnType<typeof setInterval> | undefined;
+  /** Wall-clock time of the last rediscovery attempt that was started (not debounced away). */
+  let lastRediscoveryStartedAt = 0;
   let authPatchInstalled = false;
 
   const timeoutFetch: typeof globalThis.fetch = (input, init) => {
@@ -280,7 +291,7 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
 
     const intervalMs = config.oauthRediscoverySeconds * 1000;
     rediscoveryTimer = setInterval(() => {
-      void rediscoverOAuthMetadata();
+      void rediscoverOAuthMetadata({ force: true });
     }, intervalMs);
     // Allow the process to exit naturally in tests / short-lived runs.
     rediscoveryTimer.unref?.();
@@ -296,7 +307,7 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
     }
   }
 
-  async function rediscoverOAuthMetadata(): Promise<void> {
+  async function rediscoverOAuthMetadata(options?: { force?: boolean }): Promise<void> {
     if (config.tokenEndpoint) {
       logger.debug('Skipping OAuth rediscovery (manual token endpoint configured)');
       return;
@@ -305,7 +316,18 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
       await inflightRediscovery;
       return;
     }
+    if (!options?.force) {
+      const elapsed = Date.now() - lastRediscoveryStartedAt;
+      if (lastRediscoveryStartedAt > 0 && elapsed < REDISCOVERY_RECONNECT_MIN_INTERVAL_MS) {
+        logger.debug('Skipping OAuth rediscovery (recent attempt)', {
+          elapsedMs: elapsed,
+          minIntervalMs: REDISCOVERY_RECONNECT_MIN_INTERVAL_MS,
+        });
+        return;
+      }
+    }
 
+    lastRediscoveryStartedAt = Date.now();
     inflightRediscovery = (async () => {
       logger.debug('Starting OAuth rediscovery');
       const previousSnapshot = discoverySnapshot;

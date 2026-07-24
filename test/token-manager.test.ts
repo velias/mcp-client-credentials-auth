@@ -1243,6 +1243,50 @@ describe('TokenManager', () => {
       expect(discoverCalls).toBe(1);
     });
 
+    it('debounces non-forced rediscovery within 5 minutes', async () => {
+      setupAuthenticatedDiscovery();
+      mockAuth.mockImplementation(async (provider) => {
+        await Promise.resolve(provider.saveTokens({
+          access_token: 'tok',
+          token_type: 'bearer',
+          expires_in: 3600,
+        }));
+        return 'AUTHORIZED';
+      });
+
+      const logger = createMockLogger();
+      const tm = createTokenManager(createTestConfig(), logger);
+      await tm.discover();
+
+      let discoverCalls = 0;
+      mockDiscoverResource.mockImplementation(async () => {
+        discoverCalls++;
+        await Promise.resolve();
+        return {
+          resource: 'https://mcp.example.com/mcp',
+          authorization_servers: ['https://auth.example.com'],
+          scopes_supported: ['read', 'write'],
+        };
+      });
+
+      await tm.rediscoverOAuthMetadata();
+      expect(discoverCalls).toBe(1);
+
+      await tm.rediscoverOAuthMetadata();
+      expect(discoverCalls).toBe(1);
+      expect(logger.debug).toHaveBeenCalledWith(
+        'Skipping OAuth rediscovery (recent attempt)',
+        expect.objectContaining({ minIntervalMs: 5 * 60 * 1000 }),
+      );
+
+      await tm.rediscoverOAuthMetadata({ force: true });
+      expect(discoverCalls).toBe(2);
+
+      await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+      await tm.rediscoverOAuthMetadata();
+      expect(discoverCalls).toBe(3);
+    });
+
     it('preserves prior token when rediscovery transport fails', async () => {
       setupAuthenticatedDiscovery();
       mockAuth.mockImplementation(async (provider) => {

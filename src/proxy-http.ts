@@ -92,9 +92,12 @@ export async function createHttpProxy(
           if (sid && sessions.has(sid)) {
             logger.info('HTTP MCP session transport closed', { sessionId: sid });
             sessions.delete(sid);
-            if (!closingIntentionally) {
-              void session.close().catch(() => {});
-            }
+          } else {
+            logger.info('HTTP MCP session transport closed', sid ? { sessionId: sid } : undefined);
+          }
+          // Always tear down the session (including half-init before sessionId is assigned).
+          if (!closingIntentionally) {
+            void session.close().catch(() => {});
           }
         };
 
