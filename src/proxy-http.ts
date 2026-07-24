@@ -125,10 +125,12 @@ export async function createHttpProxy(
       }
 
       if (!sessionId && req.method === 'POST' && isInitializeRequest(req.body)) {
+        const localSessionId: { current?: string } = {};
         const session = createProxySession(config, tokenManager, logger, {
           discoveredCapabilities: discovery.capabilities,
           remoteServerInfo: discovery.serverInfo,
           onLocalDisconnect: 'close',
+          localSessionId,
         });
 
         // Assigned in onsessioninitialized after connect; closed over by transport handlers.
@@ -137,6 +139,7 @@ export async function createHttpProxy(
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (id) => {
+            localSessionId.current = id;
             if (!entry) {
               entry = { transport, session, lastActiveAt: Date.now() };
             }

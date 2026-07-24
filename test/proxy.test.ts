@@ -106,6 +106,7 @@ function createMockConfig(overrides?: Partial<Config>): Config {
     listenPath: '/mcp',
     oauthRediscoverySeconds: 3600,
     httpSessionIdleSeconds: 1800,
+    auditCalls: false,
     debug: false,
     ...overrides,
   };
@@ -622,5 +623,245 @@ describe('Proxy (createStdioProxy integration)', () => {
         requestSpy.mockRestore();
       }
     });
+  });
+
+  describe('Call audit logging (disabled by default for stdio)', () => {
+    it('does not emit audit lines when auditCalls is false', async () => {
+      const upstream = getUpstreamServer();
+      upstream.fallbackRequestHandler = async (request) => {
+        if (request.method === 'tools/call') {
+          return { content: [{ type: 'text', text: 'ok' }] };
+        }
+        if (request.method === 'tools/list') {
+          return { tools: [] };
+        }
+        return {};
+      };
+
+      vi.mocked(logger.info).mockClear();
+      await endClient.callTool({ name: 'my-tool', arguments: { secret: 'x' } });
+      await endClient.listTools();
+
+      const auditCalls = vi.mocked(logger.info).mock.calls.filter(
+        (call) =>
+          typeof call[1] === 'object'
+          && call[1] !== null
+          && 'outcome' in call[1],
+      );
+      expect(auditCalls).toHaveLength(0);
+    });
+  });
+});
+
+describe('Proxy call audit logging (enabled)', () => {
+  let endClient: Client;
+  let proxyHandle: { close(): Promise<void> };
+  let logger: Logger;
+
+  beforeEach(async () => {
+    connectCount = 0;
+    upstreamServers.length = 0;
+    upstreamToolsList = undefined;
+
+    const config = createMockConfig({ auditCalls: true });
+    logger = createMockLogger();
+    const tokenManager = createMockTokenManager();
+
+    const { createStdioProxy } = await import('../src/proxy-stdio.js');
+    proxyHandle = await createStdioProxy(config, tokenManager, logger);
+
+    endClient = new Client(
+      { name: 'audit-client', version: '1.0.0' },
+      { capabilities: { sampling: {}, elicitation: {} } },
+    );
+    await endClient.connect(localTransportPair[0]);
+    await new Promise((r) => setTimeout(r, 50));
+  });
+
+  afterEach(async () => {
+    await proxyHandle?.close().catch(() => {});
+    await endClient?.close().catch(() => {});
+    for (const s of upstreamServers) {
+      await s.close().catch(() => {});
+    }
+    upstreamServers.length = 0;
+  });
+
+  function getUpstreamServer(): Server {
+    return upstreamServers[upstreamServers.length - 1];
+  }
+
+  function auditLogs(method: string) {
+    return vi.mocked(logger.info).mock.calls.filter(
+      (call) => call[0] === method && typeof call[1] === 'object' && call[1] !== null && 'outcome' in call[1],
+    );
+  }
+
+  it('audits server-to-client sampling and elicitation without logging bodies', async () => {
+    endClient.fallbackRequestHandler = async (request) => {
+      if (request.method === 'sampling/createMessage') {
+        return {
+          role: 'assistant',
+          model: 'test-model',
+          content: { type: 'text', text: 'sampled response' },
+        };
+      }
+      if (request.method === 'elicitation/create') {
+        return { action: 'accept', content: { answer: 'secret-user-input' } };
+      }
+      return {};
+    };
+
+    const upstream = getUpstreamServer();
+    vi.mocked(logger.info).mockClear();
+
+    await upstream.request(
+      {
+        method: 'sampling/createMessage',
+        params: {
+          messages: [{ role: 'user', content: { type: 'text', text: 'do-not-log-prompt' } }],
+          maxTokens: 100,
+        },
+      } as Parameters<typeof upstream.request>[0],
+      permissiveSchema,
+    );
+    await upstream.request(
+      {
+        method: 'elicitation/create',
+        params: {
+          message: 'do-not-log-elicit',
+          requestedSchema: { type: 'object', properties: { answer: { type: 'string' } } },
+        },
+      } as Parameters<typeof upstream.request>[0],
+      permissiveSchema,
+    );
+
+    const samplingLogs = auditLogs('sampling/createMessage');
+    expect(samplingLogs).toHaveLength(1);
+    expect(samplingLogs[0][1]).toEqual(
+      expect.objectContaining({ outcome: 'ok', durationMs: expect.any(Number) }),
+    );
+    expect(JSON.stringify(samplingLogs[0][1])).not.toContain('do-not-log-prompt');
+
+    const elicitLogs = auditLogs('elicitation/create');
+    expect(elicitLogs).toHaveLength(1);
+    expect(elicitLogs[0][1]).toEqual(
+      expect.objectContaining({ outcome: 'ok', durationMs: expect.any(Number) }),
+    );
+    expect(JSON.stringify(elicitLogs[0][1])).not.toContain('do-not-log-elicit');
+    expect(JSON.stringify(elicitLogs[0][1])).not.toContain('secret-user-input');
+  });
+
+  it('audits tools/list and tools/call without logging arguments', async () => {
+    const upstream = getUpstreamServer();
+    upstream.fallbackRequestHandler = async (request) => {
+      if (request.method === 'tools/list') {
+        return {
+          tools: [
+            { name: 'my-tool', description: 't', inputSchema: { type: 'object' as const } },
+          ],
+        };
+      }
+      if (request.method === 'tools/call') {
+        return { content: [{ type: 'text', text: 'ok' }] };
+      }
+      return {};
+    };
+
+    vi.mocked(logger.info).mockClear();
+    await endClient.listTools();
+    await endClient.callTool({ name: 'my-tool', arguments: { secret: 'do-not-log' } });
+
+    const listLogs = auditLogs('tools/list');
+    expect(listLogs).toHaveLength(1);
+    expect(listLogs[0][1]).toEqual(
+      expect.objectContaining({ outcome: 'ok', durationMs: expect.any(Number) }),
+    );
+    expect(listLogs[0][1]).not.toHaveProperty('tool');
+    expect(listLogs[0][1]).not.toHaveProperty('sessionId');
+
+    const callLogs = auditLogs('tools/call');
+    expect(callLogs).toHaveLength(1);
+    expect(callLogs[0][1]).toEqual(
+      expect.objectContaining({
+        tool: 'my-tool',
+        outcome: 'ok',
+        durationMs: expect.any(Number),
+      }),
+    );
+    expect(JSON.stringify(callLogs[0][1])).not.toContain('do-not-log');
+    expect(callLogs[0][1]).not.toHaveProperty('arguments');
+  });
+
+  it('audits resources/read and prompts/get identity fields', async () => {
+    const upstream = getUpstreamServer();
+    upstream.fallbackRequestHandler = async (request) => {
+      if (request.method === 'resources/read') {
+        return { contents: [{ uri: String((request.params as { uri?: string }).uri), text: 'x' }] };
+      }
+      if (request.method === 'prompts/get') {
+        return { messages: [] };
+      }
+      return {};
+    };
+
+    vi.mocked(logger.info).mockClear();
+    await endClient.readResource({ uri: 'file:///docs/a.md' });
+    await endClient.getPrompt({ name: 'summarize' });
+
+    const resourceLogs = auditLogs('resources/read');
+    expect(resourceLogs).toHaveLength(1);
+    expect(resourceLogs[0][1]).toEqual(
+      expect.objectContaining({ uri: 'file:///docs/a.md', outcome: 'ok' }),
+    );
+
+    const promptLogs = auditLogs('prompts/get');
+    expect(promptLogs).toHaveLength(1);
+    expect(promptLogs[0][1]).toEqual(
+      expect.objectContaining({ prompt: 'summarize', outcome: 'ok' }),
+    );
+  });
+
+  it('audits failures with error_category and error', async () => {
+    const upstream = getUpstreamServer();
+    upstream.fallbackRequestHandler = async (request) => {
+      if (request.method === 'tools/call') {
+        throw new Error('tool exploded');
+      }
+      return {};
+    };
+
+    vi.mocked(logger.info).mockClear();
+    await expect(endClient.callTool({ name: 'boom', arguments: {} })).rejects.toThrow();
+
+    const callLogs = auditLogs('tools/call');
+    expect(callLogs).toHaveLength(1);
+    expect(callLogs[0][1]).toEqual(
+      expect.objectContaining({
+        tool: 'boom',
+        outcome: 'error',
+        error_category: 'remote',
+        error: expect.stringContaining('tool exploded'),
+        durationMs: expect.any(Number),
+      }),
+    );
+  });
+
+  it('does not audit non-allowlisted methods', async () => {
+    const upstream = getUpstreamServer();
+    upstream.fallbackRequestHandler = async (request) => {
+      if (request.method === 'foo/bar') {
+        return { ok: true };
+      }
+      return {};
+    };
+
+    vi.mocked(logger.info).mockClear();
+    await endClient.request(
+      { method: 'foo/bar', params: {} } as Parameters<typeof endClient.request>[0],
+      permissiveSchema,
+    );
+
+    expect(auditLogs('foo/bar')).toHaveLength(0);
   });
 });
