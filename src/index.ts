@@ -49,6 +49,7 @@ async function main(): Promise<void> {
           listenHost: config.listenHost,
           listenPort: config.listenPort,
           listenPath: config.listenPath,
+          httpSessionIdleSeconds: config.httpSessionIdleSeconds,
         }
       : {}),
     oauthRediscoverySeconds: config.oauthRediscoverySeconds,

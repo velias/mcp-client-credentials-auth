@@ -34,6 +34,8 @@ export const ConfigSchema = z.object({
   listenPort: z.number().int().min(1).max(65535).default(8080),
   listenPath: z.string().min(1).default('/mcp').transform(normalizeListenPath),
   oauthRediscoverySeconds: z.number().int().min(0).default(3600),
+  /** HTTP mode: evict sessions with no inbound MCP traffic for this long. `0` disables. */
+  httpSessionIdleSeconds: z.number().int().min(0).default(1800),
 });
 
 export type Config = z.infer<typeof ConfigSchema>;
@@ -71,6 +73,9 @@ export function loadConfig(): Config {
     listenPath: process.env.MCP_CC_PROXY_LISTEN_PATH || undefined,
     oauthRediscoverySeconds: parseNumber(
       process.env.MCP_CC_PROXY_OAUTH_REDISCOVERY_SECONDS,
+    ),
+    httpSessionIdleSeconds: parseNumber(
+      process.env.MCP_CC_PROXY_HTTP_SESSION_IDLE_SECONDS,
     ),
   };
 

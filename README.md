@@ -67,6 +67,7 @@ All configuration via `MCP_CC_PROXY_*` environment variables:
 | `MCP_CC_PROXY_LISTEN_HOST` | No | `127.0.0.1` | HTTP bind host (HTTP mode only; container image defaults to `0.0.0.0`) |
 | `MCP_CC_PROXY_LISTEN_PORT` | No | `8080` | HTTP bind port (HTTP mode only) |
 | `MCP_CC_PROXY_LISTEN_PATH` | No | `/mcp` | MCP Streamable HTTP mount path (HTTP mode only) |
+| `MCP_CC_PROXY_HTTP_SESSION_IDLE_SECONDS` | No | `1800` | HTTP mode: close sessions with no inbound MCP traffic for this long (`0` disables). See [On-premises HTTP deployment](#on-premises-http-deployment-alternative). |
 | `MCP_CC_PROXY_OAUTH_REDISCOVERY_SECONDS` | No | `3600` | Interval to re-fetch OAuth PRM/AS metadata (both transports). `0` disables the timer only. See [OAuth discovery and scopes at runtime](#oauth-discovery-and-scopes-at-runtime). |
 
 ### Servers without OAuth discovery
@@ -102,6 +103,8 @@ Prefer `https://` for the token endpoint; cleartext HTTP to a non-loopback host 
 Use this when several MCP clients on a private network should share one outbound `client_credentials` identity, and you do not want to deploy this proxy on every client machine. Prefer local **stdio** (Quick Start) whenever a single client can spawn the proxy; HTTP adds a shared network attack surface.
 
 Set `MCP_CC_PROXY_TRANSPORT=http`. The process listens for cleartext Streamable HTTP on `MCP_CC_PROXY_LISTEN_HOST` / `PORT` / `PATH` (defaults: `127.0.0.1:8080/mcp`). There is **no inbound authentication** on the proxy: anyone who can open an MCP session gets the full remote service-account privilege.
+
+Sessions with no inbound MCP traffic for `MCP_CC_PROXY_HTTP_SESSION_IDLE_SECONDS` (default 30 minutes; `0` disables) are closed and removed. That cleans up clients that abandon a session without `DELETE` (for example some MCP reload/logout paths). A later request that still sends the old `mcp-session-id` receives `404` / `Session not found`; the proxy does **not** silently attach that id to a new session. Spec-compliant Streamable HTTP clients re-`initialize` without a session id and continue on a new session.
 
 ### Recommended HTTPS deployment
 
@@ -291,7 +294,7 @@ All auth proxy logs go to **stderr** (stdout is reserved for MCP protocol). To s
 
 Set `MCP_CC_PROXY_DEBUG=true` for verbose OAuth discovery, forwarding, and refresh scheduling details.
 
-Runtime failures use the same three categories in JSON-RPC errors and stderr (`category=`), prefixed with `mcp-client-credentials-auth`:
+Runtime failures use the same three categories in JSON-RPC errors and stderr (`category="authentication"` etc.), prefixed with `mcp-client-credentials-auth`:
 
 | Category | Meaning | Example |
 |----------|---------|---------|
@@ -322,7 +325,7 @@ For stdio, MCP clients typically treat the server as healthy when the process is
 |-----------|----------|
 | Remote MCP disconnects | Requests get `connection` errors (e.g. `temporarily unavailable (reconnecting)`). Indefinite background reconnect with backoff; resumes when the remote is back. |
 | Remote MCP restarted / Streamable HTTP session not found | Detects stale session (HTTP 404 or session-loss message), recreates the remote session, retries the request once; logs session lost and session reacquired on stderr. |
-| Remote MCP / IdP OAuth metadata or discovered scopes change while running | Re-checked on successful remote reconnect and on the rediscovery interval. See [OAuth discovery and scopes at runtime](#oauth-discovery-and-scopes-at-runtime). |
+| Remote MCP / IdP OAuth metadata or discovered scopes change while running | Re-checked on successful remote reconnect (debounced) and on the rediscovery interval. See [OAuth discovery and scopes at runtime](#oauth-discovery-and-scopes-at-runtime). |
 | IdP down but a cached access token is still valid | Keeps serving until the token is no longer usable. |
 | No usable access token and refresh/auth fails | Requests get a short `authentication` error (`no usable access token`). Indefinite background refresh/retry; resumes when a token is acquired again. |
 
@@ -345,7 +348,7 @@ Without `MCP_CC_PROXY_SCOPES`, the proxy requests the full discovered `scopes_su
 
 ### OAuth discovery and scopes at runtime
 
-Protected resource metadata (RFC 9728), authorization server metadata (RFC 8414), and scopes for `client_credentials` are resolved at startup (or taken from `MCP_CC_PROXY_SCOPES` / `MCP_CC_PROXY_TOKEN_ENDPOINT`). They are re-checked after a successful remote reconnect and on a schedule (`MCP_CC_PROXY_OAUTH_REDISCOVERY_SECONDS`, default 1 hour; `0` disables the timer only). Proactive token refresh does not re-fetch those descriptors.
+Protected resource metadata (RFC 9728), authorization server metadata (RFC 8414), and scopes for `client_credentials` are resolved at startup (or taken from `MCP_CC_PROXY_SCOPES` / `MCP_CC_PROXY_TOKEN_ENDPOINT`). They are re-checked after a successful remote reconnect and on a schedule (`MCP_CC_PROXY_OAUTH_REDISCOVERY_SECONDS`, default 1 hour; `0` disables the timer only). Reconnect-triggered rediscovery is debounced (at most once every 5 minutes) so a flapping remote does not spam `.well-known` endpoints; the scheduled timer always runs on its interval.
 
 On a **significant** change (authorization server URL, token endpoint, issuer, discovered `scopes_supported` when `MCP_CC_PROXY_SCOPES` is unset, or auth mode flip), the proxy drops the cached access token and acquires a new one. Comparison uses PRM/AS discovery snapshots, not live step-up scope unions. Transient `.well-known` failures (including dual PRM/AS outage, or partial AS failure that would look like `no-auth`) keep the previous discovery and token when the process was already authenticated; rediscovery does not downgrade away from authenticated mode on those paths. With `MCP_CC_PROXY_TOKEN_ENDPOINT`, OAuth PRM/AS rediscovery is skipped entirely. `MCP_CC_PROXY_SCOPES` still wins over discovered scopes; if you rely on that override and scopes must change, update the env and restart.
 

@@ -30,10 +30,10 @@ describe('Logger', () => {
 
       expect(stderrSpy).toHaveBeenCalledTimes(1);
       const output = stderrSpy.mock.calls[0][0] as string;
-      expect(output).toContain('level=info');
-      expect(output).toContain('component=mcp-client-credentials-auth');
-      expect(output).toContain('msg=test message');
-      expect(output).toContain('ts=');
+      expect(output).toContain('level="info"');
+      expect(output).toContain('component="mcp-client-credentials-auth"');
+      expect(output).toContain('msg="test message"');
+      expect(output).toMatch(/^ts="[^"]+"/);
       expect(output).toMatch(/\n$/);
     });
 
@@ -42,9 +42,9 @@ describe('Logger', () => {
       logger.warn('warning here');
 
       const output = stderrSpy.mock.calls[0][0] as string;
-      expect(output).toContain('level=warn');
-      expect(output).toContain('component=mcp-client-credentials-auth');
-      expect(output).toContain('msg=warning here');
+      expect(output).toContain('level="warn"');
+      expect(output).toContain('component="mcp-client-credentials-auth"');
+      expect(output).toContain('msg="warning here"');
     });
 
     it('writes error messages to stderr', () => {
@@ -52,9 +52,9 @@ describe('Logger', () => {
       logger.error('something broke');
 
       const output = stderrSpy.mock.calls[0][0] as string;
-      expect(output).toContain('level=error');
-      expect(output).toContain('component=mcp-client-credentials-auth');
-      expect(output).toContain('msg=something broke');
+      expect(output).toContain('level="error"');
+      expect(output).toContain('component="mcp-client-credentials-auth"');
+      expect(output).toContain('msg="something broke"');
     });
 
     it('includes category metadata on failure logs', () => {
@@ -65,9 +65,9 @@ describe('Logger', () => {
       });
 
       const output = stderrSpy.mock.calls[0][0] as string;
-      expect(output).toContain('component=mcp-client-credentials-auth');
-      expect(output).toContain('category=authentication');
-      expect(output).toContain('error=Invalid scopes: api.graphql');
+      expect(output).toContain('component="mcp-client-credentials-auth"');
+      expect(output).toContain('category="authentication"');
+      expect(output).toContain('error="Invalid scopes: api.graphql"');
     });
 
     it('writes debug messages when debug is enabled', () => {
@@ -76,9 +76,9 @@ describe('Logger', () => {
 
       expect(stderrSpy).toHaveBeenCalledTimes(1);
       const output = stderrSpy.mock.calls[0][0] as string;
-      expect(output).toContain('level=debug');
-      expect(output).toContain('component=mcp-client-credentials-auth');
-      expect(output).toContain('msg=debug info');
+      expect(output).toContain('level="debug"');
+      expect(output).toContain('component="mcp-client-credentials-auth"');
+      expect(output).toContain('msg="debug info"');
     });
 
     it('suppresses debug messages when debug is disabled', () => {
@@ -90,13 +90,21 @@ describe('Logger', () => {
   });
 
   describe('metadata formatting', () => {
-    it('appends key=value metadata', () => {
+    it('appends quoted key="value" metadata', () => {
       const logger = createLogger();
       logger.info('with meta', { host: 'example.com', port: 443 });
 
       const output = stderrSpy.mock.calls[0][0] as string;
-      expect(output).toContain('host=example.com');
-      expect(output).toContain('port=443');
+      expect(output).toContain('host="example.com"');
+      expect(output).toContain('port="443"');
+    });
+
+    it('escapes quotes inside string values', () => {
+      const logger = createLogger();
+      logger.info('quoted', { error: 'say "hello"' });
+
+      const output = stderrSpy.mock.calls[0][0] as string;
+      expect(output).toContain('error="say \\"hello\\""');
     });
 
     it('does not append metadata section when meta is empty', () => {
@@ -104,10 +112,19 @@ describe('Logger', () => {
       logger.info('nometa', {});
 
       const output = stderrSpy.mock.calls[0][0] as string;
-      // Should be: ts=... level=info component=... msg=nometa\n (no trailing key=value pairs)
       expect(output).toMatch(
-        /^ts=\S+ level=info component=mcp-client-credentials-auth msg=nometa\n$/,
+        /^ts="\S+" level="info" component="mcp-client-credentials-auth" msg="nometa"\n$/,
       );
+    });
+
+    it('prints undefined meta values as empty quoted strings', () => {
+      const logger = createLogger();
+      logger.info('partial', { host: 'example.com', missing: undefined });
+
+      const output = stderrSpy.mock.calls[0][0] as string;
+      expect(output).toContain('host="example.com"');
+      expect(output).toContain('missing=""');
+      expect(output).not.toContain('undefined');
     });
   });
 
@@ -130,7 +147,7 @@ describe('Logger', () => {
       expect(output).not.toContain('some-token');
       expect(output).not.toContain('p4ss');
       expect(output).not.toContain('sshhh');
-      expect(output).toContain('[REDACTED]');
+      expect(output).toContain('"[REDACTED]"');
     });
 
     it('does not redact non-secret keys', () => {
@@ -138,8 +155,25 @@ describe('Logger', () => {
       logger.info('safe', { hostname: 'example.com', method: 'GET' });
 
       const output = stderrSpy.mock.calls[0][0] as string;
-      expect(output).toContain('hostname=example.com');
-      expect(output).toContain('method=GET');
+      expect(output).toContain('hostname="example.com"');
+      expect(output).toContain('method="GET"');
+    });
+
+    it('does not redact token endpoint URL metadata', () => {
+      const logger = createLogger();
+      logger.info('discovery', {
+        tokenEndpoint: 'https://auth.example.com/oauth/token',
+        token_endpoint: 'https://auth.example.com/oauth/token',
+      });
+
+      const output = stderrSpy.mock.calls[0][0] as string;
+      expect(output).toContain(
+        'tokenEndpoint="https://auth.example.com/oauth/token"',
+      );
+      expect(output).toContain(
+        'token_endpoint="https://auth.example.com/oauth/token"',
+      );
+      expect(output).not.toContain('[REDACTED]');
     });
 
     it('does not redact empty string values even for secret keys', () => {
@@ -147,6 +181,7 @@ describe('Logger', () => {
       logger.info('empty', { token: '' });
 
       const output = stderrSpy.mock.calls[0][0] as string;
+      expect(output).toContain('token=""');
       expect(output).not.toContain('[REDACTED]');
     });
   });

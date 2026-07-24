@@ -77,6 +77,7 @@ function createMockConfig(overrides?: Partial<Config>): Config {
     listenPort: 8080,
     listenPath: '/mcp',
     oauthRediscoverySeconds: 3600,
+    httpSessionIdleSeconds: 1800,
     debug: false,
     ...overrides,
   };
@@ -238,8 +239,8 @@ describe('Proxy capabilities polling', () => {
     };
     await endClient.connect(localTransportPair[0]);
 
-    // Wait for Phase 3 + first poll
-    await new Promise((r) => setTimeout(r, 200));
+    // Wait for Phase 3 + first poll (allows up to 5s jitter capped by 0.1s interval)
+    await new Promise((r) => setTimeout(r, 350));
 
     // Update handler on the real upstream (last one)
     const upstream = upstreamServers[upstreamServers.length - 1];
@@ -255,8 +256,8 @@ describe('Proxy capabilities polling', () => {
       return {};
     };
 
-    // Wait for second poll to detect change
-    await new Promise((r) => setTimeout(r, 200));
+    // Wait for a later poll to detect change
+    await new Promise((r) => setTimeout(r, 350));
 
     expect(notifications).toContain('notifications/tools/list_changed');
   });
@@ -324,7 +325,7 @@ describe('Proxy resources and prompts polling', () => {
     };
     await endClient.connect(localTransportPair[0]);
 
-    await new Promise((r) => setTimeout(r, 200));
+    await new Promise((r) => setTimeout(r, 350));
 
     // Update upstream handler after first poll
     const upstream = upstreamServers[upstreamServers.length - 1];
@@ -335,7 +336,7 @@ describe('Proxy resources and prompts polling', () => {
       return {};
     };
 
-    await new Promise((r) => setTimeout(r, 200));
+    await new Promise((r) => setTimeout(r, 350));
     expect(notifications).toContain('notifications/resources/list_changed');
   });
 
@@ -369,7 +370,7 @@ describe('Proxy resources and prompts polling', () => {
     };
     await endClient.connect(localTransportPair[0]);
 
-    await new Promise((r) => setTimeout(r, 200));
+    await new Promise((r) => setTimeout(r, 350));
 
     const upstream = upstreamServers[upstreamServers.length - 1];
     upstream.fallbackRequestHandler = async (request) => {
@@ -379,7 +380,7 @@ describe('Proxy resources and prompts polling', () => {
       return {};
     };
 
-    await new Promise((r) => setTimeout(r, 200));
+    await new Promise((r) => setTimeout(r, 350));
     expect(notifications).toContain('notifications/prompts/list_changed');
   });
 });

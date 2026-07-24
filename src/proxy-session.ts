@@ -437,32 +437,41 @@ export function createProxySession(
 
   // Capabilities polling
   let pollInterval: ReturnType<typeof setInterval> | undefined;
+  let pollStartTimer: ReturnType<typeof setTimeout> | undefined;
+  let pollInflight = false;
 
   function stopPolling(): void {
     if (pollInterval) {
       clearInterval(pollInterval);
       pollInterval = undefined;
     }
+    if (pollStartTimer) {
+      clearTimeout(pollStartTimer);
+      pollStartTimer = undefined;
+    }
   }
 
   function startPolling(): void {
     if (config.capabilitiesPollSeconds <= 0) return;
-    if (pollInterval) return;
+    if (pollInterval || pollStartTimer) return;
 
     let lastToolsHash = '';
     let lastResourcesHash = '';
     let lastPromptsHash = '';
+    const intervalMs = config.capabilitiesPollSeconds * 1000;
+    const requestTimeout = { timeout: config.requestTimeoutMs };
 
     const pollCapabilities = async () => {
-      if (!remoteClient) return;
+      if (!remoteClient || pollInflight) return;
+      pollInflight = true;
       try {
         const caps = remoteClient.getServerCapabilities() ?? {};
         const client = remoteClient;
 
         const [toolsResult, resourcesResult, promptsResult] = await Promise.all([
-          caps.tools ? client.listTools() : undefined,
-          caps.resources ? client.listResources() : undefined,
-          caps.prompts ? client.listPrompts() : undefined,
+          caps.tools ? client.listTools(undefined, requestTimeout) : undefined,
+          caps.resources ? client.listResources(undefined, requestTimeout) : undefined,
+          caps.prompts ? client.listPrompts(undefined, requestTimeout) : undefined,
         ]);
 
         if (toolsResult) {
@@ -501,16 +510,21 @@ export function createProxySession(
         if (isStaleRemoteSessionError(err)) {
           void recoverStaleRemoteSession({ error: err });
         }
+      } finally {
+        pollInflight = false;
       }
     };
 
-    void pollCapabilities();
-    pollInterval = setInterval(
-      () => void pollCapabilities(),
-      config.capabilitiesPollSeconds * 1000,
-    );
+    // Jitter the first tick so multi-session HTTP creates do not align on the same wall clock.
+    const jitterMs = Math.floor(Math.random() * Math.min(intervalMs, 5000));
+    pollStartTimer = setTimeout(() => {
+      pollStartTimer = undefined;
+      void pollCapabilities();
+      pollInterval = setInterval(() => void pollCapabilities(), intervalMs);
+    }, jitterMs);
     logger.info('Capabilities polling started', {
       intervalSeconds: config.capabilitiesPollSeconds,
+      firstPollJitterMs: jitterMs,
     });
   }
 

@@ -168,6 +168,20 @@ describe('Config', () => {
     expect(config.listenPort).toBe(8080);
     expect(config.listenPath).toBe('/mcp');
     expect(config.oauthRediscoverySeconds).toBe(3600);
+    expect(config.httpSessionIdleSeconds).toBe(1800);
+  });
+
+  it('allows httpSessionIdleSeconds of 0', () => {
+    setRequiredEnv();
+    process.env.MCP_CC_PROXY_HTTP_SESSION_IDLE_SECONDS = '0';
+    const config = loadConfig();
+    expect(config.httpSessionIdleSeconds).toBe(0);
+  });
+
+  it('rejects negative httpSessionIdleSeconds', () => {
+    setRequiredEnv();
+    process.env.MCP_CC_PROXY_HTTP_SESSION_IDLE_SECONDS = '-1';
+    expect(() => loadConfig()).toThrow('Invalid configuration');
   });
 
   it('parses MCP_CC_PROXY_TRANSPORT=http and listen settings', () => {
