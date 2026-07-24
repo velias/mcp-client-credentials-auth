@@ -77,6 +77,7 @@ function createMockConfig(overrides?: Partial<Config>): Config {
     listenPort: 0,
     listenPath: '/mcp',
     oauthRediscoverySeconds: 0,
+    httpSessionIdleSeconds: 0,
     debug: false,
     ...overrides,
   };
@@ -202,6 +203,64 @@ describe('HTTP proxy (createHttpProxy)', () => {
     // Health still works after session close
     const res = await fetch(`http://127.0.0.1:${proxyHandle.listenPort}/health/live`);
     expect(res.status).toBe(200);
+  });
+
+  it('evicts idle sessions; old id returns 404; new initialize works', async () => {
+    const config = createMockConfig({ httpSessionIdleSeconds: 1 });
+    logger = createMockLogger();
+    const tokenManager = createMockTokenManager();
+    const { createHttpProxy } = await import('../src/proxy-http.js');
+    proxyHandle = await createHttpProxy(config, tokenManager, logger);
+
+    expect(logger.info).toHaveBeenCalledWith(
+      'HTTP session idle sweep started',
+      expect.objectContaining({ idleSeconds: 1 }),
+    );
+
+    const url = new URL(`http://127.0.0.1:${proxyHandle.listenPort}${config.listenPath}`);
+    const client = new Client(
+      { name: 'http-idle-client', version: '1.0.0' },
+      { capabilities: {} },
+    );
+    const transport = new StreamableHTTPClientTransport(url);
+    await client.connect(transport);
+    const sid = transport.sessionId;
+    expect(sid).toBeTruthy();
+
+    // Idle=1s → sweep every 1s; wait past deadline + a sweep.
+    await new Promise((r) => setTimeout(r, 2500));
+
+    expect(logger.info).toHaveBeenCalledWith(
+      'HTTP MCP session idle timeout',
+      expect.objectContaining({ sessionId: sid, idleSeconds: 1 }),
+    );
+
+    const stale = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'mcp-session-id': sid!,
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/list',
+        params: {},
+      }),
+    });
+    expect(stale.status).toBe(404);
+
+    const client2 = new Client(
+      { name: 'http-idle-client-2', version: '1.0.0' },
+      { capabilities: {} },
+    );
+    const transport2 = new StreamableHTTPClientTransport(url);
+    await client2.connect(transport2);
+    expect(transport2.sessionId).toBeTruthy();
+    expect(transport2.sessionId).not.toBe(sid);
+
+    await client2.close().catch(() => {});
+    await client.close().catch(() => {});
   });
 
   it('returns 404 for an unknown mcp-session-id', async () => {

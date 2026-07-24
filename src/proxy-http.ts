@@ -14,6 +14,7 @@ import type { TokenManager } from './token-manager.js';
 interface HttpSessionEntry {
   transport: StreamableHTTPServerTransport;
   session: ProxySession;
+  lastActiveAt: number;
 }
 
 function sendJsonRpcError(
@@ -41,6 +42,7 @@ export async function createHttpProxy(
   const app = createMcpExpressApp({ host: config.listenHost });
   const sessions = new Map<string, HttpSessionEntry>();
   let closingIntentionally = false;
+  let idleSweepTimer: ReturnType<typeof setInterval> | undefined;
 
   // Kubernetes-style probes: process up only (no IdP / remote MCP checks).
   app.get('/health/live', (_req: Request, res: Response) => {
@@ -54,12 +56,70 @@ export async function createHttpProxy(
     res.status(200).json({ status: 'ok' });
   });
 
+  function touchSession(entry: HttpSessionEntry): void {
+    entry.lastActiveAt = Date.now();
+  }
+
+  /**
+   * Close a session that was already removed from `sessions` (or never inserted).
+   * `transport.close()` fires onclose, which calls `session.close()` again; that is idempotent enough.
+   */
+  function teardownSession(entry: HttpSessionEntry): void {
+    void entry.transport.close().catch(() => {});
+  }
+
+  function evictIdleSessions(): void {
+    if (config.httpSessionIdleSeconds <= 0 || closingIntentionally) return;
+    const idleMs = config.httpSessionIdleSeconds * 1000;
+    const now = Date.now();
+    const staleIds: string[] = [];
+    for (const [id, entry] of sessions) {
+      if (now - entry.lastActiveAt >= idleMs) {
+        staleIds.push(id);
+      }
+    }
+    for (const id of staleIds) {
+      const entry = sessions.get(id);
+      if (!entry) continue;
+      sessions.delete(id);
+      logger.info('HTTP MCP session idle timeout', {
+        sessionId: id,
+        idleSeconds: config.httpSessionIdleSeconds,
+        activeSessions: sessions.size,
+      });
+      teardownSession(entry);
+    }
+  }
+
+  function startIdleSweep(): void {
+    if (idleSweepTimer || config.httpSessionIdleSeconds <= 0) return;
+    const idleMs = config.httpSessionIdleSeconds * 1000;
+    // Notice soon after the idle deadline; floor 1s (tests), cap 30s.
+    const sweepMs = Math.min(30_000, Math.max(1_000, Math.floor(idleMs / 6)));
+    idleSweepTimer = setInterval(() => {
+      evictIdleSessions();
+    }, sweepMs);
+    idleSweepTimer.unref?.();
+    logger.info('HTTP session idle sweep started', {
+      idleSeconds: config.httpSessionIdleSeconds,
+      sweepIntervalMs: sweepMs,
+    });
+  }
+
+  function stopIdleSweep(): void {
+    if (idleSweepTimer) {
+      clearInterval(idleSweepTimer);
+      idleSweepTimer = undefined;
+    }
+  }
+
   async function handleMcpRequest(req: Request, res: Response): Promise<void> {
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
     try {
       if (sessionId && sessions.has(sessionId)) {
         const entry = sessions.get(sessionId)!;
+        touchSession(entry);
         await entry.transport.handleRequest(req, res, req.body);
         return;
       }
@@ -78,22 +138,38 @@ export async function createHttpProxy(
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (id) => {
             if (!entry) {
-              entry = { transport, session };
+              entry = { transport, session, lastActiveAt: Date.now() };
             }
+            touchSession(entry);
             sessions.set(id, entry);
-            logger.info('HTTP MCP session created', { sessionId: id });
+            logger.info('HTTP MCP session created', {
+              sessionId: id,
+              activeSessions: sessions.size,
+            });
           },
         });
 
-        entry = { transport, session };
+        entry = { transport, session, lastActiveAt: Date.now() };
 
+        // Guard against close → localServer.close → transport.close → onclose recursion.
+        let sessionTeardownStarted = false;
         transport.onclose = () => {
+          if (sessionTeardownStarted) return;
+          sessionTeardownStarted = true;
           const sid = transport.sessionId;
           if (sid && sessions.has(sid)) {
-            logger.info('HTTP MCP session transport closed', { sessionId: sid });
             sessions.delete(sid);
+            logger.info('HTTP MCP session transport closed', {
+              sessionId: sid,
+              activeSessions: sessions.size,
+            });
           } else {
-            logger.info('HTTP MCP session transport closed', sid ? { sessionId: sid } : undefined);
+            logger.info(
+              'HTTP MCP session transport closed',
+              sid
+                ? { sessionId: sid, activeSessions: sessions.size }
+                : { activeSessions: sessions.size },
+            );
           }
           // Always tear down the session (including half-init before sessionId is assigned).
           if (!closingIntentionally) {
@@ -107,6 +183,7 @@ export async function createHttpProxy(
       }
 
       if (sessionId) {
+        // Evicted/unknown id: client must re-initialize without mcp-session-id (not auto-created here).
         sendJsonRpcError(res, 404, -32001, 'Session not found');
         return;
       }
@@ -142,10 +219,13 @@ export async function createHttpProxy(
   const boundPort =
     typeof address === 'object' && address !== null ? address.port : config.listenPort;
 
+  startIdleSweep();
+
   logger.info('Local MCP server started on Streamable HTTP', {
     host: config.listenHost,
     port: boundPort,
     path: config.listenPath,
+    httpSessionIdleSeconds: config.httpSessionIdleSeconds,
   });
 
   return {
@@ -154,6 +234,7 @@ export async function createHttpProxy(
       logger.info('Shutting down HTTP proxy');
       // Flip readiness first so probes can observe 503 before the listener stops.
       closingIntentionally = true;
+      stopIdleSweep();
       const entries = [...sessions.values()];
       sessions.clear();
       await Promise.all(entries.map(async (entry) => {
