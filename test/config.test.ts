@@ -235,4 +235,30 @@ describe('Config', () => {
     expect(() => loadConfig()).toThrow('Invalid configuration');
   });
 
+  it('leaves allowedTools undefined when MCP_CC_PROXY_ALLOWED_TOOLS is not set', () => {
+    setRequiredEnv();
+    const config = loadConfig();
+    expect(config.allowedTools).toBeUndefined();
+  });
+
+  it('treats blank MCP_CC_PROXY_ALLOWED_TOOLS as undefined', () => {
+    setRequiredEnv();
+    process.env.MCP_CC_PROXY_ALLOWED_TOOLS = '   ';
+    const config = loadConfig();
+    expect(config.allowedTools).toBeUndefined();
+  });
+
+  it('parses, trims, and dedupes MCP_CC_PROXY_ALLOWED_TOOLS', () => {
+    setRequiredEnv();
+    process.env.MCP_CC_PROXY_ALLOWED_TOOLS = ' search , get_weather,search, list_files ';
+    const config = loadConfig();
+    expect(config.allowedTools).toEqual(['search', 'get_weather', 'list_files']);
+  });
+
+  it('rejects MCP_CC_PROXY_ALLOWED_TOOLS with only commas/whitespace', () => {
+    setRequiredEnv();
+    process.env.MCP_CC_PROXY_ALLOWED_TOOLS = ' , , ';
+    expect(() => loadConfig()).toThrow('contains no tool names');
+  });
+
 });

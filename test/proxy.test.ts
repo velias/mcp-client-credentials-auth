@@ -865,3 +865,118 @@ describe('Proxy call audit logging (enabled)', () => {
     expect(auditLogs('foo/bar')).toHaveLength(0);
   });
 });
+
+describe('Proxy tool allowlist', () => {
+  let endClient: Client;
+  let proxyHandle: { close(): Promise<void> };
+  let logger: Logger;
+
+  beforeEach(async () => {
+    connectCount = 0;
+    upstreamServers.length = 0;
+    upstreamToolsList = undefined;
+
+    const config = createMockConfig({
+      allowedTools: ['search', 'list_files'],
+      auditCalls: true,
+    });
+    logger = createMockLogger();
+    const tokenManager = createMockTokenManager();
+
+    const { createStdioProxy } = await import('../src/proxy-stdio.js');
+    proxyHandle = await createStdioProxy(config, tokenManager, logger);
+
+    endClient = new Client(
+      { name: 'allowlist-client', version: '1.0.0' },
+      { capabilities: {} },
+    );
+    await endClient.connect(localTransportPair[0]);
+    await new Promise((r) => setTimeout(r, 50));
+  });
+
+  afterEach(async () => {
+    await proxyHandle?.close().catch(() => {});
+    await endClient?.close().catch(() => {});
+    for (const s of upstreamServers) {
+      await s.close().catch(() => {});
+    }
+    upstreamServers.length = 0;
+  });
+
+  function getUpstreamServer(): Server {
+    return upstreamServers[upstreamServers.length - 1];
+  }
+
+  it('logs tool allowlist enabled at startup', () => {
+    expect(logger.info).toHaveBeenCalledWith(
+      'Tool allowlist enabled',
+      expect.objectContaining({ count: 2 }),
+    );
+  });
+
+  it('filters tools/list to allowed tools only', async () => {
+    const upstream = getUpstreamServer();
+    upstream.fallbackRequestHandler = async (request) => {
+      if (request.method === 'tools/list') {
+        return {
+          tools: [
+            { name: 'search', description: 'Search', inputSchema: { type: 'object' as const } },
+            { name: 'delete', description: 'Delete', inputSchema: { type: 'object' as const } },
+            { name: 'list_files', description: 'List', inputSchema: { type: 'object' as const } },
+          ],
+          nextCursor: 'page-2',
+        };
+      }
+      return {};
+    };
+
+    const result = await endClient.listTools();
+    expect(result.tools.map((t) => t.name)).toEqual(['search', 'list_files']);
+    expect((result as { nextCursor?: string }).nextCursor).toBe('page-2');
+  });
+
+  it('forwards tools/call for allowed tools', async () => {
+    const upstream = getUpstreamServer();
+    const upstreamHandler = vi.fn(async (request: { method: string; params?: unknown }) => {
+      if (request.method === 'tools/call') {
+        return { content: [{ type: 'text', text: 'ok' }] };
+      }
+      return {};
+    });
+    upstream.fallbackRequestHandler = upstreamHandler;
+
+    const result = await endClient.callTool({ name: 'search', arguments: { q: 'x' } });
+    expect(result.content).toBeDefined();
+    expect(upstreamHandler).toHaveBeenCalled();
+    expect(upstreamHandler.mock.calls[0][0]).toEqual(
+      expect.objectContaining({
+        method: 'tools/call',
+        params: expect.objectContaining({ name: 'search' }),
+      }),
+    );
+  });
+
+  it('rejects tools/call for disallowed tools without forwarding', async () => {
+    const upstream = getUpstreamServer();
+    const upstreamHandler = vi.fn(async () => ({}));
+    upstream.fallbackRequestHandler = upstreamHandler;
+
+    vi.mocked(logger.info).mockClear();
+    await expect(
+      endClient.callTool({ name: 'delete', arguments: {} }),
+    ).rejects.toThrow(/not allowed by proxy configuration/);
+
+    expect(upstreamHandler).not.toHaveBeenCalled();
+
+    const callLogs = vi.mocked(logger.info).mock.calls.filter((call) => call[0] === 'tools/call');
+    expect(callLogs).toHaveLength(1);
+    expect(callLogs[0][1]).toEqual(
+      expect.objectContaining({
+        tool: 'delete',
+        outcome: 'error',
+        error_category: 'remote',
+        error: expect.stringContaining('not allowed by proxy configuration'),
+      }),
+    );
+  });
+});

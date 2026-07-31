@@ -4,3 +4,4 @@ coverage/
 *.js.map
 .env
 .cursor/plans/
+docs/blog/org-service-accounts-customer-docs-draft.md
