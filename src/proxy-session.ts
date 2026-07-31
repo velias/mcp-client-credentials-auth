@@ -1,6 +1,7 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import type { ClientCapabilities, Implementation, ServerCapabilities } from '@modelcontextprotocol/sdk/types.js';
+import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod/v3';
 import { getBackoffDelay } from './backoff.js';
 import type { Config } from './config.js';
@@ -8,6 +9,7 @@ import {
   PROXY_NAME,
   classifyError,
   errorDetail,
+  formatProxyError,
   isStaleRemoteSessionError,
   toClientError,
   wrapCaughtError,
@@ -21,6 +23,11 @@ import {
   sanitizeMeta,
   withClientCredentialsExtension,
 } from './proxy-utils.js';
+import {
+  createToolAllowlist,
+  filterToolsListResult,
+  isToolAllowed,
+} from './tool-filter.js';
 
 const permissiveSchema = z.object({}).passthrough();
 
@@ -69,6 +76,11 @@ export function createProxySession(
 ): ProxySession {
   const remoteUrl = new URL(config.remoteMcpUrl);
   const discoveredCapabilities = options.discoveredCapabilities;
+  const toolAllowlist = createToolAllowlist(config.allowedTools);
+  if (toolAllowlist) {
+    logger.info('Tool allowlist enabled', { count: toolAllowlist.size });
+    logger.debug('Tool allowlist names', { tools: [...toolAllowlist].join(',') });
+  }
 
   const localServer = new Server(
     options.remoteServerInfo ?? { name: PROXY_NAME, version: PKG_VERSION },
@@ -401,6 +413,14 @@ export function createProxySession(
     );
   }
 
+  function applyToolsListFilter(
+    method: string,
+    response: Record<string, unknown>,
+  ): Record<string, unknown> {
+    if (method !== 'tools/list') return response;
+    return filterToolsListResult(toolAllowlist, response);
+  }
+
   function auditIdentity(
     method: string,
     params: Record<string, unknown> | undefined,
@@ -442,8 +462,32 @@ export function createProxySession(
       throw toClientError('authentication', 'no usable access token');
     }
 
+    if (request.method === 'tools/call') {
+      const toolName =
+        typeof sanitizedParams?.name === 'string' ? sanitizedParams.name : undefined;
+      if (!isToolAllowed(toolAllowlist, toolName)) {
+        const label = toolName ?? 'unknown';
+        const detail = `tool "${label}" is not allowed by proxy configuration`;
+        logger.debug('Rejecting tools/call: tool not in allowlist', { tool: label });
+        if (shouldAudit) {
+          emitCallAudit(request.method, started, identity, {
+            outcome: 'error',
+            error_category: 'remote',
+            error: detail,
+          });
+        }
+        throw new McpError(ErrorCode.InvalidParams, formatProxyError('remote', detail), {
+          source: PROXY_NAME,
+          category: 'remote',
+        });
+      }
+    }
+
     try {
-      const response = await forwardRequest(request.method, sanitizedParams);
+      const response = applyToolsListFilter(
+        request.method,
+        await forwardRequest(request.method, sanitizedParams),
+      );
       if (shouldAudit) {
         emitCallAudit(request.method, started, identity, { outcome: 'ok' });
       }
@@ -456,7 +500,10 @@ export function createProxySession(
         });
         if (recovered) {
           try {
-            const response = await forwardRequest(request.method, sanitizedParams);
+            const response = applyToolsListFilter(
+              request.method,
+              await forwardRequest(request.method, sanitizedParams),
+            );
             if (shouldAudit) {
               emitCallAudit(request.method, started, identity, { outcome: 'ok' });
             }
@@ -593,7 +640,8 @@ export function createProxySession(
         ]);
 
         if (toolsResult) {
-          const hash = JSON.stringify(toolsResult.tools);
+          const visibleTools = filterToolsListResult(toolAllowlist, toolsResult).tools;
+          const hash = JSON.stringify(visibleTools);
           if (lastToolsHash && hash !== lastToolsHash) {
             logger.info('Remote tools changed, notifying local client');
             await localServer.sendToolListChanged();

@@ -69,6 +69,7 @@ All configuration via `MCP_CC_PROXY_*` environment variables:
 | `MCP_CC_PROXY_LISTEN_PATH` | No | `/mcp` | MCP Streamable HTTP mount path (HTTP mode only) |
 | `MCP_CC_PROXY_HTTP_SESSION_IDLE_SECONDS` | No | `1800` | HTTP mode: close sessions with no inbound MCP traffic for this long (`0` disables). See [On-premises HTTP deployment](#on-premises-http-deployment-alternative). |
 | `MCP_CC_PROXY_AUDIT_CALLS` | No | `false` (stdio), `true` (http) | Emit per-call usage audit lines to stderr. See [Call audit log](#call-audit-log). |
+| `MCP_CC_PROXY_ALLOWED_TOOLS` | No | — (all tools) | Comma-separated tool name allowlist. When set, filters `tools/list` and blocks non-listed `tools/call`. See [Tool allowlist](#tool-allowlist). |
 | `MCP_CC_PROXY_OAUTH_REDISCOVERY_SECONDS` | No | `3600` | Interval to re-fetch OAuth PRM/AS metadata (both transports). `0` disables the timer only. See [OAuth discovery and scopes at runtime](#oauth-discovery-and-scopes-at-runtime). |
 
 ### Servers without OAuth discovery
@@ -414,6 +415,17 @@ During `initialize`, the auth proxy forwards identity and capabilities in both d
 Your MCP client sees the remote server's real name. The remote sees a name like `cursor-vscode via mcp-client-credentials-auth v0.2.0` with the client's version. Local capabilities (`sampling`, `roots`, `elicitation`, etc.) are forwarded so server-to-client features work through the proxy.
 
 The proxy also declares the [`io.modelcontextprotocol/oauth-client-credentials`](https://modelcontextprotocol.io/extensions/auth/oauth-client-credentials) extension on both connections so the remote can apply machine-to-machine policies.
+
+## Tool allowlist
+
+When `MCP_CC_PROXY_ALLOWED_TOOLS` is unset or blank, the proxy forwards all tools unchanged. When set to a comma-separated list of tool names (trimmed, case-sensitive, duplicates ignored), the proxy:
+
+- Filters `tools/list` so the local client only sees allowed tools (other response fields such as `nextCursor` are preserved)
+- Rejects `tools/call` for any name not on the list before the request reaches the remote server (`InvalidParams`, category `remote`)
+
+Example: `MCP_CC_PROXY_ALLOWED_TOOLS=search,list_files`.
+
+This is a coarse local ACL for limiting which remote tools a client can see and invoke through this process. It is not a substitute for inbound auth, multi-tenant RBAC, or a full [MCP gateway](#using-an-mcp-gateway-optional-hardening). Resources and prompts are not filtered.
 
 ## Call audit log
 

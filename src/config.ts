@@ -41,6 +41,11 @@ export const ConfigSchema = z.object({
    * Resolved in loadConfig: default false for stdio, true for http when env unset.
    */
   auditCalls: z.boolean(),
+  /**
+   * Optional tool name allowlist. Unset = no filtering.
+   * Parsed from MCP_CC_PROXY_ALLOWED_TOOLS (comma-separated).
+   */
+  allowedTools: z.array(z.string().min(1)).optional(),
 });
 
 export type Config = z.infer<typeof ConfigSchema>;
@@ -56,8 +61,37 @@ function parseNumber(value: string | undefined): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
+/**
+ * Parse MCP_CC_PROXY_ALLOWED_TOOLS: comma-separated names, trimmed, deduped.
+ * Blank/unset → undefined (feature off). Non-blank with zero names → throws.
+ */
+function parseAllowedTools(value: string | undefined): string[] | undefined {
+  if (value === undefined) return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+
+  const seen = new Set<string>();
+  const names: string[] = [];
+  for (const part of trimmed.split(',')) {
+    const name = part.trim();
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    names.push(name);
+  }
+
+  if (names.length === 0) {
+    throw new Error(
+      'Invalid configuration:\n  allowedTools: MCP_CC_PROXY_ALLOWED_TOOLS is set but contains no tool names\n\n' +
+        'Required env vars: MCP_CC_PROXY_REMOTE_MCP_URL, MCP_CC_PROXY_CLIENT_ID, MCP_CC_PROXY_CLIENT_SECRET',
+    );
+  }
+
+  return names;
+}
+
 export function loadConfig(): Config {
   const transport = process.env.MCP_CC_PROXY_TRANSPORT || 'stdio';
+  const allowedTools = parseAllowedTools(process.env.MCP_CC_PROXY_ALLOWED_TOOLS);
   const raw = {
     remoteMcpUrl: process.env.MCP_CC_PROXY_REMOTE_MCP_URL,
     clientId: process.env.MCP_CC_PROXY_CLIENT_ID,
@@ -86,6 +120,7 @@ export function loadConfig(): Config {
     auditCalls: process.env.MCP_CC_PROXY_AUDIT_CALLS
       ? parseBool(process.env.MCP_CC_PROXY_AUDIT_CALLS)
       : transport === 'http',
+    allowedTools,
   };
 
   const result = ConfigSchema.safeParse(raw);
