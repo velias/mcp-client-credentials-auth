@@ -5,11 +5,18 @@ import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
 import {
   PROXY_NAME,
   classifyError,
+  formatPermanentRemoteUrlError,
   formatProxyError,
   formatUnrecoverableOAuthMisconfig,
+  getPermanentRemoteHttpStatus,
+  getRemoteHttpResponseBody,
+  getRemoteHttpStatus,
   isPermanentOAuthConfigError,
+  isPermanentRemoteHttpError,
   isStaleRemoteSessionError,
   isUnrecoverableStartupAuthError,
+  remoteHttpErrorLogMeta,
+  resolveUnrecoverableStartupAuthSource,
   toClientError,
   wrapCaughtError,
 } from '../src/errors.js';
@@ -104,6 +111,115 @@ describe('errors', () => {
       }
       expect(isUnrecoverableStartupAuthError(new FakeServerError('IdP busy'))).toBe(false);
     });
+
+    it('is true for HTTP 401 from Streamable HTTP (Bearer rejected, same as UnauthorizedError)', () => {
+      const unauthorized = new StreamableHTTPError(
+        401,
+        'Server returned 401 after successful authentication',
+      );
+      expect(isUnrecoverableStartupAuthError(unauthorized)).toBe(true);
+      expect(resolveUnrecoverableStartupAuthSource(unauthorized)).toBe('mcp-server');
+      expect(isPermanentRemoteHttpError(unauthorized)).toBe(false);
+    });
+
+    it('is false for HTTP 404 (wrong URL is a connection fail-fast, not an auth misconfig)', () => {
+      expect(
+        isUnrecoverableStartupAuthError(new StreamableHTTPError(404, 'Error POSTing to endpoint: Not Found')),
+      ).toBe(false);
+    });
+  });
+
+  describe('permanent remote HTTP URL errors', () => {
+    it('treats connect-time 4xx as permanent except 401 (auth), 408, and 429', () => {
+      const notFound = new StreamableHTTPError(404, 'Error POSTing to endpoint: Not Found');
+      expect(getRemoteHttpStatus(notFound)).toBe(404);
+      expect(getPermanentRemoteHttpStatus(notFound)).toBe(404);
+      expect(isPermanentRemoteHttpError(notFound)).toBe(true);
+      expect(isPermanentRemoteHttpError(new StreamableHTTPError(400, 'Bad Request'))).toBe(true);
+      expect(isPermanentRemoteHttpError(new StreamableHTTPError(403, 'Forbidden'))).toBe(true);
+      expect(isPermanentRemoteHttpError(new StreamableHTTPError(405, 'Method Not Allowed'))).toBe(
+        true,
+      );
+      expect(isPermanentRemoteHttpError(new StreamableHTTPError(410, 'Gone'))).toBe(true);
+      expect(isPermanentRemoteHttpError(new StreamableHTTPError(415, 'Unsupported Media Type'))).toBe(
+        true,
+      );
+      expect(isPermanentRemoteHttpError(new StreamableHTTPError(401, 'Unauthorized'))).toBe(false);
+      expect(getPermanentRemoteHttpStatus(new StreamableHTTPError(401, 'Unauthorized'))).toBe(
+        undefined,
+      );
+      expect(isPermanentRemoteHttpError(new StreamableHTTPError(408, 'Request Timeout'))).toBe(
+        false,
+      );
+      expect(isPermanentRemoteHttpError(new StreamableHTTPError(429, 'Too Many Requests'))).toBe(
+        false,
+      );
+    });
+
+    it('reads SSE POST status from the message', () => {
+      const err = new Error('Error POSTing to endpoint (HTTP 404): Not Found');
+      expect(getRemoteHttpStatus(err)).toBe(404);
+      expect(isPermanentRemoteHttpError(err)).toBe(true);
+    });
+
+    it('is false for transient statuses, sentinel codes, and generic connection errors', () => {
+      expect(isPermanentRemoteHttpError(new StreamableHTTPError(500, 'Error POSTing to endpoint: boom'))).toBe(
+        false,
+      );
+      expect(isPermanentRemoteHttpError(new StreamableHTTPError(503, 'Service Unavailable'))).toBe(
+        false,
+      );
+      expect(isPermanentRemoteHttpError(new StreamableHTTPError(-1, 'Unexpected content type: text/html'))).toBe(
+        false,
+      );
+      expect(getRemoteHttpStatus(new StreamableHTTPError(-1, 'Unexpected content type: text/html'))).toBe(
+        undefined,
+      );
+      expect(isPermanentRemoteHttpError(new Error('ECONNREFUSED'))).toBe(false);
+      expect(isPermanentRemoteHttpError(new UnauthorizedError('Unauthorized'))).toBe(false);
+    });
+
+    it('formats an operator-facing URL check that mentions no-auth when OAuth was missing', () => {
+      const message = formatPermanentRemoteUrlError(404, 'https://mcp.example.com/mcpp', {
+        oauthMetadataMissing: true,
+        responseBody: 'Cannot POST /mcpp',
+      });
+      expect(message).toContain(`${PROXY_NAME} [connection]:`);
+      expect(message).toContain('HTTP 404');
+      expect(message).toContain('MCP_CC_PROXY_REMOTE_MCP_URL (https://mcp.example.com/mcpp)');
+      expect(message).toContain('client error, not a transient outage');
+      expect(message).toContain('no-auth');
+      expect(message).toContain('Remote response: Cannot POST /mcpp');
+    });
+
+    it('extracts and truncates the remote HTTP response body for logs', () => {
+      const jsonBody = '{"jsonrpc":"2.0","error":{"message":"nope"}}';
+      const posted = new StreamableHTTPError(404, `Error POSTing to endpoint: ${jsonBody}`);
+      expect(getRemoteHttpResponseBody(posted)).toBe(jsonBody);
+      expect(remoteHttpErrorLogMeta(posted)).toEqual({
+        httpStatus: 404,
+        responseBody: jsonBody,
+      });
+
+      const sse = new Error('Error POSTing to endpoint (HTTP 405): Method Not Allowed');
+      expect(getRemoteHttpResponseBody(sse)).toBe('Method Not Allowed');
+      expect(remoteHttpErrorLogMeta(sse)).toEqual({
+        httpStatus: 405,
+        responseBody: 'Method Not Allowed',
+      });
+
+      const html = new StreamableHTTPError(
+        404,
+        `Error POSTing to endpoint: <html>\n${'x'.repeat(600)}</html>`,
+      );
+      const truncated = getRemoteHttpResponseBody(html);
+      expect(truncated).toContain(' ...[truncated]');
+      expect(truncated?.length).toBeLessThan(600);
+      expect(truncated).not.toContain('\n');
+
+      expect(getRemoteHttpResponseBody(new Error('ECONNREFUSED'))).toBeUndefined();
+      expect(remoteHttpErrorLogMeta(new Error('ECONNREFUSED'))).toEqual({});
+    });
   });
 
   describe('isStaleRemoteSessionError', () => {
@@ -166,6 +282,15 @@ describe('errors', () => {
       expect(classifyError(new UnauthorizedError('Unauthorized'), 'token')).toBe(
         'authentication',
       );
+    });
+
+    it('classifies HTTP 401 like UnauthorizedError (resource-server Bearer rejection)', () => {
+      const unauthorized = new StreamableHTTPError(
+        401,
+        'Server returned 401 after successful authentication',
+      );
+      expect(classifyError(unauthorized)).toBe('remote');
+      expect(classifyError(unauthorized, 'token')).toBe('authentication');
     });
 
     it('classifies generic errors as connection', () => {

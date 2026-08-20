@@ -102,8 +102,8 @@ describe('TokenManager', () => {
       await tm.discover();
 
       expect(tm.getAuthMode().type).toBe('no-auth');
-      expect(logger.warn).toHaveBeenCalledWith(
-        expect.stringContaining('does not announce auth requirements'),
+      expect(logger.info).toHaveBeenCalledWith(
+        expect.stringContaining('OAuth well-known metadata not found'),
       );
     });
 
@@ -168,8 +168,8 @@ describe('TokenManager', () => {
       await tm.discover();
 
       expect(tm.getAuthMode().type).toBe('no-auth');
-      expect(logger.warn).toHaveBeenCalledWith(
-        expect.stringContaining('does not announce auth requirements'),
+      expect(logger.info).toHaveBeenCalledWith(
+        expect.stringContaining('OAuth well-known metadata not found'),
       );
 
       tm.stop();
@@ -214,7 +214,7 @@ describe('TokenManager', () => {
 
       expect(tm.getAuthMode().type).toBe('no-auth');
       expect(logger.info).toHaveBeenCalledWith(
-        'Auth readiness: no-auth mode (token not required)',
+        'Auth readiness: no OAuth metadata; MCP connect will not send a Bearer token',
       );
       tm.stop();
     });

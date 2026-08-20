@@ -13,6 +13,20 @@ const OAUTH_ERROR_CODE_KEY = 'errorCode';
 /** Session-loss phrases used by non-spec or older servers (secondary detection). */
 const STALE_SESSION_MESSAGE_RE = /session not found|no valid session|invalid session|unknown session/i;
 
+/**
+ * 4xx that are still worth retrying at Phase 1 (RFC 9110).
+ * Other 400-499 statuses fail-fast as a wrong URL, except 401 (auth path).
+ */
+const RETRYABLE_CLIENT_HTTP_STATUSES = new Set([408, 429]);
+
+/** SSEClientTransport: `Error POSTing to endpoint (HTTP 404): ...` */
+const SSE_HTTP_STATUS_RE = /\(HTTP (\d{3})\)/;
+const SSE_POST_BODY_RE = /^Error POSTing to endpoint \(HTTP \d{3}\):\s?([\s\S]*)$/;
+const STREAMABLE_HTTP_ERROR_PREFIX = 'Streamable HTTP error: ';
+const STREAMABLE_POST_BODY_PREFIX = 'Error POSTing to endpoint: ';
+/** Cap HTML/JSON error pages so a single stderr line stays usable. */
+const MAX_LOGGED_RESPONSE_BODY_CHARS = 500;
+
 function hasOAuthErrorCode(err: unknown): err is Error & { errorCode: string } {
   return (
     err instanceof Error &&
@@ -44,7 +58,7 @@ export function isPermanentOAuthConfigError(err: unknown): boolean {
 /**
  * True when startup should not retry because the access token path is misconfigured:
  * IdP permanent OAuth errors, or the remote MCP server rejecting the Bearer token
- * (`UnauthorizedError`, `invalid_token`, `insufficient_scope`).
+ * (`UnauthorizedError`, HTTP 401, `invalid_token`, `insufficient_scope`).
  */
 export function isUnrecoverableStartupAuthError(err: unknown): boolean {
   if (isPermanentOAuthConfigError(err)) {
@@ -56,7 +70,7 @@ export function isUnrecoverableStartupAuthError(err: unknown): boolean {
   if (hasOAuthErrorCode(err)) {
     return err.errorCode === 'invalid_token' || err.errorCode === 'insufficient_scope';
   }
-  return false;
+  return getRemoteHttpStatus(err) === 401;
 }
 
 /** Where an unrecoverable startup auth failure was detected. */
@@ -109,10 +123,23 @@ export function errorDetail(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+function asHttpStatus(code: number): number | undefined {
+  return Number.isInteger(code) && code >= 100 && code <= 599 ? code : undefined;
+}
+
+function isPermanentClientHttpStatus(status: number): boolean {
+  // 401 is a Bearer/token rejection; startup routes it through the auth path.
+  if (status === 401) {
+    return false;
+  }
+  return status >= 400 && status < 500 && !RETRYABLE_CLIENT_HTTP_STATUSES.has(status);
+}
+
 /**
  * Read HTTP status from a StreamableHTTPError-shaped failure.
  * Duck-typed so tests can mock the transport module without exporting the class,
  * and so wrapped copies that preserve `code` + the SDK message prefix still match.
+ * Ignores non-HTTP sentinel codes (e.g. SDK `-1` for unexpected content type).
  */
 function getStreamableHttpStatus(err: unknown): number | undefined {
   if (
@@ -121,9 +148,113 @@ function getStreamableHttpStatus(err: unknown): number | undefined {
     typeof (err as { code: unknown }).code === 'number' &&
     err.message.startsWith('Streamable HTTP error:')
   ) {
-    return (err as { code: number }).code;
+    return asHttpStatus((err as { code: number }).code);
   }
   return undefined;
+}
+
+/**
+ * HTTP status from a Streamable HTTP or SSE transport failure, when present.
+ */
+export function getRemoteHttpStatus(err: unknown): number | undefined {
+  const streamable = getStreamableHttpStatus(err);
+  if (streamable !== undefined) {
+    return streamable;
+  }
+  const match = SSE_HTTP_STATUS_RE.exec(errorDetail(err));
+  if (!match) {
+    return undefined;
+  }
+  return asHttpStatus(Number(match[1]));
+}
+
+function sanitizeLoggedResponseBody(text: string | undefined): string | undefined {
+  if (text === undefined) {
+    return undefined;
+  }
+  const collapsed = text.replace(/\s+/g, ' ').trim();
+  if (!collapsed) {
+    return undefined;
+  }
+  if (collapsed.length <= MAX_LOGGED_RESPONSE_BODY_CHARS) {
+    return collapsed;
+  }
+  return `${collapsed.slice(0, MAX_LOGGED_RESPONSE_BODY_CHARS)} ...[truncated]`;
+}
+
+/**
+ * Remote HTTP response body (or statusText) from a Streamable HTTP / SSE transport
+ * error, collapsed and truncated for logs. Undefined when the error is not HTTP-shaped.
+ */
+export function getRemoteHttpResponseBody(err: unknown): string | undefined {
+  const raw = errorDetail(err);
+  let payload: string | undefined;
+  if (raw.startsWith(STREAMABLE_HTTP_ERROR_PREFIX)) {
+    const rest = raw.slice(STREAMABLE_HTTP_ERROR_PREFIX.length);
+    payload = rest.startsWith(STREAMABLE_POST_BODY_PREFIX)
+      ? rest.slice(STREAMABLE_POST_BODY_PREFIX.length)
+      : rest;
+  } else {
+    const sse = SSE_POST_BODY_RE.exec(raw);
+    if (sse) {
+      payload = sse[1];
+    }
+  }
+  return sanitizeLoggedResponseBody(payload);
+}
+
+/** Status and body fields for stderr meta on remote HTTP transport failures. */
+export function remoteHttpErrorLogMeta(err: unknown): Record<string, unknown> {
+  const meta: Record<string, unknown> = {};
+  const httpStatus = getRemoteHttpStatus(err);
+  if (httpStatus !== undefined) {
+    meta.httpStatus = httpStatus;
+  }
+  const responseBody = getRemoteHttpResponseBody(err);
+  if (responseBody !== undefined) {
+    meta.responseBody = responseBody;
+  }
+  return meta;
+}
+
+/**
+ * Connect-time HTTP 4xx that will not self-heal (wrong URL, forbidden, not an MCP
+ * endpoint, etc.). Undefined for 401 (auth path), 408/429, 5xx, and non-HTTP errors.
+ *
+ * Use at Phase 1 and SSE-fallback gating. Do not use after a live session exists:
+ * HTTP 404 then means stale Streamable HTTP session (`isStaleRemoteSessionError`).
+ */
+export function getPermanentRemoteHttpStatus(err: unknown): number | undefined {
+  const status = getRemoteHttpStatus(err);
+  if (status === undefined || !isPermanentClientHttpStatus(status)) {
+    return undefined;
+  }
+  return status;
+}
+
+export function isPermanentRemoteHttpError(err: unknown): boolean {
+  return getPermanentRemoteHttpStatus(err) !== undefined;
+}
+
+/**
+ * Operator-facing message for a Phase 1 HTTP 4xx against `MCP_CC_PROXY_REMOTE_MCP_URL`.
+ */
+export function formatPermanentRemoteUrlError(
+  status: number,
+  remoteMcpUrl: string,
+  options?: { oauthMetadataMissing?: boolean; responseBody?: string },
+): string {
+  let detail =
+    `Remote MCP URL returned HTTP ${status}. Check MCP_CC_PROXY_REMOTE_MCP_URL (${remoteMcpUrl}); ` +
+    'this is a client error, not a transient outage.';
+  if (options?.oauthMetadataMissing) {
+    detail +=
+      ' OAuth discovery also found no metadata (no-auth), which is common when the path is wrong.';
+  }
+  if (options?.responseBody) {
+    detail += ` Remote response: ${options.responseBody}`;
+  }
+  return formatProxyError('connection', detail);
 }
 
 function hasStaleSessionMessage(err: unknown): boolean {
@@ -144,8 +275,7 @@ export function isStaleRemoteSessionError(err: unknown): boolean {
     return false;
   }
 
-  const status = getStreamableHttpStatus(err);
-  if (status === 404) {
+  if (getStreamableHttpStatus(err) === 404) {
     return true;
   }
 
@@ -165,7 +295,7 @@ export function classifyError(
   if (hasOAuthErrorCode(err)) {
     return 'authentication';
   }
-  if (err instanceof UnauthorizedError) {
+  if (err instanceof UnauthorizedError || getRemoteHttpStatus(err) === 401) {
     return context === 'token' ? 'authentication' : 'remote';
   }
   return 'connection';

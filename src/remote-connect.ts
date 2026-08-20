@@ -3,11 +3,19 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import type { FetchLike } from '@modelcontextprotocol/sdk/shared/transport.js';
-import { classifyError, errorDetail } from './errors.js';
+import {
+  classifyError,
+  errorDetail,
+  isPermanentRemoteHttpError,
+  remoteHttpErrorLogMeta,
+} from './errors.js';
 import type { Logger } from './logger.js';
 
 /** SSE uses the same authProvider; only retry on transport-shaped failures. */
 function shouldFallbackToSse(err: unknown): boolean {
+  if (isPermanentRemoteHttpError(err)) {
+    return false;
+  }
   return classifyError(err) === 'connection';
 }
 
@@ -54,11 +62,12 @@ export async function connectWithTransportFallback(
   } catch (httpErr) {
     const detail = errorDetail(httpErr);
     const category = classifyError(httpErr);
+    const httpMeta = remoteHttpErrorLogMeta(httpErr);
     if (!shouldFallbackToSse(httpErr)) {
-      logger.warn(msgs.noSse, { category, error: detail });
+      logger.warn(msgs.noSse, { category, error: detail, ...httpMeta });
       throw httpErr;
     }
-    logger.warn(msgs.trySse, { category, error: detail });
+    logger.warn(msgs.trySse, { category, error: detail, ...httpMeta });
     const sseTransport = new SSEClientTransport(remoteUrl, { authProvider });
     await client.connect(sseTransport);
     logger.info(msgs.sseOk, meta);

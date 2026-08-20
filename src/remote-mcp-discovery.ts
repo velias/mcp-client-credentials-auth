@@ -6,7 +6,11 @@ import {
   PROXY_NAME,
   classifyError,
   errorDetail,
+  formatPermanentRemoteUrlError,
   formatUnrecoverableOAuthMisconfig,
+  getPermanentRemoteHttpStatus,
+  getRemoteHttpResponseBody,
+  remoteHttpErrorLogMeta,
   resolveUnrecoverableStartupAuthSource,
 } from './errors.js';
 import type { Logger } from './logger.js';
@@ -61,7 +65,11 @@ export async function discoverRemoteMcp(
       attempt: phase1Attempt + 1,
     });
     try {
-      return await connectDiscoveryClient();
+      const result = await connectDiscoveryClient();
+      if (tokenManager.getAuthMode().type === 'no-auth') {
+        logger.info('Remote MCP is reachable without OAuth (no-auth)');
+      }
+      return result;
     } catch (err) {
       const detail = errorDetail(err);
       const category = classifyError(err);
@@ -73,6 +81,22 @@ export async function discoverRemoteMcp(
           unrecoverable: true,
           failureSource: authFailureSource,
           error: detail,
+        });
+        throw new Error(message, { cause: err });
+      }
+      const permanentHttpStatus = getPermanentRemoteHttpStatus(err);
+      if (permanentHttpStatus !== undefined) {
+        const responseBody = getRemoteHttpResponseBody(err);
+        const message = formatPermanentRemoteUrlError(permanentHttpStatus, config.remoteMcpUrl, {
+          oauthMetadataMissing: tokenManager.getAuthMode().type === 'no-auth',
+          responseBody,
+        });
+        logger.error(message, {
+          category: 'connection',
+          unrecoverable: true,
+          error: detail,
+          url: config.remoteMcpUrl,
+          ...remoteHttpErrorLogMeta(err),
         });
         throw new Error(message, { cause: err });
       }
