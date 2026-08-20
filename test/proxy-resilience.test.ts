@@ -24,6 +24,17 @@ class FakeInvalidScopeError extends Error {
   }
 }
 
+/** Matches SDK StreamableHTTPError shape for HTTP status duck-typing. */
+class FakeStreamableHTTPError extends Error {
+  constructor(
+    readonly code: number,
+    message: string,
+  ) {
+    super(`Streamable HTTP error: ${message}`);
+    this.name = 'StreamableHTTPError';
+  }
+}
+
 function createUpstreamServer() {
   const server = new Server(
     { name: 'mock-upstream', version: '1.0.0' },
@@ -187,6 +198,51 @@ describe('Proxy resilience', () => {
         expect.anything(),
       );
     });
+
+    it('fails immediately on HTTP 404 and does not fall back to SSE', async () => {
+      transportCallCount = 0;
+      sseTransportCallCount = 0;
+      upstreamServers.length = 0;
+
+      streamableHttpThrow = () =>
+        new FakeStreamableHTTPError(404, 'Error POSTing to endpoint: Not Found');
+
+      const config = createMockConfig();
+      const logger = createMockLogger();
+      const tokenManager = createMockTokenManager({ type: 'no-auth' });
+
+      const { createStdioProxy } = await import('../src/proxy-stdio.js');
+      await expect(
+        createStdioProxy(config, tokenManager, logger, Date.now() + 60_000),
+      ).rejects.toThrow(/Remote MCP URL returned HTTP 404[\s\S]*Remote response: Not Found/);
+
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.stringMatching(/MCP_CC_PROXY_REMOTE_MCP_URL.*no-auth.*Remote response: Not Found/),
+        expect.objectContaining({
+          category: 'connection',
+          unrecoverable: true,
+          httpStatus: 404,
+          responseBody: 'Not Found',
+          url: config.remoteMcpUrl,
+        }),
+      );
+      expect(logger.warn).toHaveBeenCalledWith(
+        'Streamable HTTP connection failed, not trying SSE fallback',
+        expect.objectContaining({
+          category: 'connection',
+          httpStatus: 404,
+          responseBody: 'Not Found',
+        }),
+      );
+      expect(sseTransportCallCount).toBe(0);
+      expect(logger.warn).not.toHaveBeenCalledWith(
+        'Remote MCP server unreachable during discovery, retrying',
+        expect.anything(),
+      );
+      expect(logger.info).not.toHaveBeenCalledWith(
+        'Remote MCP is reachable without OAuth (no-auth)',
+      );
+    });
   });
 
   describe('Phase 1 discovery failure', () => {
@@ -221,6 +277,71 @@ describe('Proxy resilience', () => {
       expect(sseTransportCallCount).toBe(0);
       expect(logger.warn).not.toHaveBeenCalledWith(
         'Remote MCP server unreachable during discovery, retrying',
+        expect.anything(),
+      );
+    });
+
+    it('fails immediately on HTTP 401 Streamable HTTP as auth, not as a wrong-URL 4xx', async () => {
+      transportCallCount = 0;
+      sseTransportCallCount = 0;
+      upstreamServers.length = 0;
+
+      streamableHttpThrow = () =>
+        new FakeStreamableHTTPError(401, 'Server returned 401 after successful authentication');
+
+      const config = createMockConfig();
+      const logger = createMockLogger();
+      const tokenManager = createMockTokenManager();
+
+      const { createStdioProxy } = await import('../src/proxy-stdio.js');
+      await expect(
+        createStdioProxy(config, tokenManager, logger, Date.now() + 60_000),
+      ).rejects.toThrow(
+        /Unrecoverable OAuth misconfiguration at the remote MCP server: Streamable HTTP error: Server returned 401 after successful authentication/,
+      );
+
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.stringContaining('at the remote MCP server'),
+        expect.objectContaining({
+          category: 'authentication',
+          unrecoverable: true,
+          failureSource: 'mcp-server',
+        }),
+      );
+      expect(logger.error).not.toHaveBeenCalledWith(
+        expect.stringContaining('Remote MCP URL returned HTTP 401'),
+        expect.anything(),
+      );
+      expect(sseTransportCallCount).toBe(0);
+      expect(logger.warn).not.toHaveBeenCalledWith(
+        'Remote MCP server unreachable during discovery, retrying',
+        expect.anything(),
+      );
+    });
+
+    it('retries Phase 1 on HTTP 429 instead of fail-fast', async () => {
+      transportCallCount = 0;
+      sseTransportCallCount = 0;
+      upstreamServers.length = 0;
+
+      streamableHttpThrow = () => new FakeStreamableHTTPError(429, 'Too Many Requests');
+      transportShouldFail = () => true;
+
+      const config = createMockConfig();
+      const logger = createMockLogger();
+      const tokenManager = createMockTokenManager();
+
+      const { createStdioProxy } = await import('../src/proxy-stdio.js');
+      await expect(
+        createStdioProxy(config, tokenManager, logger, Date.now() + 80),
+      ).rejects.toThrow(/Remote MCP server unreachable within startup timeout/);
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        'Remote MCP server unreachable during discovery, retrying',
+        expect.any(Object),
+      );
+      expect(logger.error).not.toHaveBeenCalledWith(
+        expect.stringContaining('Remote MCP URL returned HTTP 429'),
         expect.anything(),
       );
     });
@@ -290,6 +411,21 @@ describe('Proxy resilience', () => {
       const result = await endClient.listTools();
       expect(result.tools).toHaveLength(1);
       expect(result.tools[0].name).toBe('recovered-tool');
+    });
+
+    it('confirms no-auth only after Phase 1 MCP connect succeeds', async () => {
+      transportCallCount = 0;
+      sseTransportCallCount = 0;
+      upstreamServers.length = 0;
+
+      const config = createMockConfig();
+      const logger = createMockLogger();
+      const tokenManager = createMockTokenManager({ type: 'no-auth' });
+
+      const { createStdioProxy } = await import('../src/proxy-stdio.js');
+      proxyHandle = await createStdioProxy(config, tokenManager, logger, Date.now() + 5000);
+
+      expect(logger.info).toHaveBeenCalledWith('Remote MCP is reachable without OAuth (no-auth)');
     });
   });
 

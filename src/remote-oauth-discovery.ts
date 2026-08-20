@@ -235,8 +235,8 @@ export async function discoverOAuthForRemote(
       };
     }
 
-    logger.warn(
-      'Remote server does not announce auth requirements -- proxying without authentication',
+    logger.info(
+      'OAuth well-known metadata not found; attempting MCP connect without a Bearer token',
     );
     const authMode: AuthMode = { type: 'no-auth' };
     return {

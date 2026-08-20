@@ -435,7 +435,9 @@ export function createTokenManager(config: Config, logger: Logger): TokenManager
       }
 
       if (mode.type === 'no-auth') {
-        logger.info('Auth readiness: no-auth mode (token not required)');
+        logger.info(
+          'Auth readiness: no OAuth metadata; MCP connect will not send a Bearer token',
+        );
         startRediscoverySchedule();
         return;
       }
